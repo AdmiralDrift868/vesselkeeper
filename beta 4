@@ -398,9 +398,92 @@ class Database:
 # ======================
 
 class VesselEditor(Gtk.Dialog):
-    # ...as previously completed...
 
-    # (no changes needed here)
+   def __init__(self, parent, db: Database, vessel: Optional[Vessel]=None):
+        title = "Edit Vessel" if vessel else "Add Vessel"
+        super().__init__(title=title, parent=parent, flags=0)
+        self.db = db
+        self.vessel = vessel
+        self.set_default_size(500, 500)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        content = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        
+        self.name_entry = self._add_form_field(grid, 0, "Name:", Gtk.Entry())
+        self.registration_entry = self._add_form_field(grid, 1, "Registration:", Gtk.Entry())
+        self.type_combo = Gtk.ComboBoxText()
+        for vt in VESSEL_TYPES:
+            self.type_combo.append_text(vt)
+        self._add_form_field(grid, 2, "Type:", self.type_combo)
+        self.length_entry = self._add_form_field(grid, 3, "Length (m):", Gtk.SpinButton.new_with_range(0, 100, 0.1))
+        self.beam_entry = self._add_form_field(grid, 4, "Beam (m):", Gtk.SpinButton.new_with_range(0, 20, 0.1))
+        self.draft_entry = self._add_form_field(grid, 5, "Draft (m):", Gtk.SpinButton.new_with_range(0, 10, 0.1))
+        self.engine_model_entry = self._add_form_field(grid, 6, "Engine Model:", Gtk.Entry())
+        self.engine_hours_entry = self._add_form_field(grid, 7, "Engine Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.hull_material_entry = self._add_form_field(grid, 8, "Hull Material:", Gtk.Entry())
+        self.build_year_entry = self._add_form_field(grid, 9, "Build Year:", Gtk.SpinButton.new_with_range(1900, 2100, 1))
+        self.last_survey_entry = self._add_form_field(grid, 10, "Last Survey:", Gtk.Entry())
+        self.insurance_expiry_entry = self._add_form_field(grid, 11, "Insurance Expiry:", Gtk.Entry())
+        self.location_entry = self._add_form_field(grid, 12, "Current Location:", Gtk.Entry())
+        self.notes_entry = self._add_form_field(grid, 13, "Notes:", Gtk.TextView(), multiline=True)
+        
+        if self.vessel:
+            self._load_existing_data()
+        
+        content.pack_start(grid, True, True, 0)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+
+    def _add_form_field(self, grid, row, label, widget, multiline=False):
+        grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+        if multiline:
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(80)
+            scroll.add(widget)
+            grid.attach(scroll, 1, row, 1, 1)
+        else:
+            grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def _load_existing_data(self):
+        self.name_entry.set_text(self.vessel.name)
+        self.registration_entry.set_text(self.vessel.registration)
+        self.type_combo.set_active(VESSEL_TYPES.index(self.vessel.vessel_type) if self.vessel.vessel_type in VESSEL_TYPES else 0)
+        self.length_entry.set_value(self.vessel.length)
+        self.beam_entry.set_value(self.vessel.beam)
+        self.draft_entry.set_value(self.vessel.draft)
+        self.engine_model_entry.set_text(self.vessel.engine_model)
+        self.engine_hours_entry.set_value(self.vessel.engine_hours)
+        self.hull_material_entry.set_text(self.vessel.hull_material)
+        self.build_year_entry.set_value(self.vessel.build_year)
+        self.last_survey_entry.set_text(self.vessel.last_survey)
+        self.insurance_expiry_entry.set_text(self.vessel.insurance_expiry)
+        self.location_entry.set_text(self.vessel.current_location)
+        buffer = self.notes_entry.get_buffer()
+        buffer.set_text(self.vessel.notes)
+
+    def get_vessel_data(self) -> Vessel:
+        buffer = self.notes_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        return Vessel(
+            id=self.vessel.id if self.vessel else None,
+            name=self.name_entry.get_text(),
+            registration=self.registration_entry.get_text(),
+            vessel_type=self.type_combo.get_active_text(),
+            length=float(self.length_entry.get_value()),
+            beam=float(self.beam_entry.get_value()),
+            draft=float(self.draft_entry.get_value()),
+            engine_model=self.engine_model_entry.get_text(),
+            engine_hours=float(self.engine_hours_entry.get_value()),
+            hull_material=self.hull_material_entry.get_text(),
+            build_year=int(self.build_year_entry.get_value()),
+            last_survey=self.last_survey_entry.get_text(),
+            insurance_expiry=self.insurance_expiry_entry.get_text(),
+            current_location=self.location_entry.get_text(),
+            notes=buffer.get_text(start, end, False)
+        )
 
 class MaintenanceTaskEditor(Gtk.Dialog):
     def __init__(self, parent, db: Database, task: Optional[MaintenanceTask] = None):
