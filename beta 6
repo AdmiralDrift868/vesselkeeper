@@ -107,9 +107,9 @@ class Supplier:
     email: str = ""
     notes: str = ""
 
-    class Database:
+class Database:
     # --- Suppliers ---
-     def add_supplier(self, supplier: Supplier) -> int:
+    def add_supplier(self, supplier: Supplier) -> int:
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO suppliers (name, contact, phone, email, notes)
@@ -139,17 +139,11 @@ class Supplier:
         cursor.execute("SELECT * FROM suppliers")
         return [Supplier(*row) for row in cursor.fetchall()]
 
-# NOTE: Don't indent this function inside any class!
-def save_config(config):
-    Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f)
-
     def __init__(self):
-     self.db_path = os.path.expanduser("~/.local/share/vesselkeeper/data.db")
-    Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-    self.conn = sqlite3.connect(self.db_path)
-    self._init_tables()
+        self.db_path = os.path.expanduser("~/.local/share/vesselkeeper/data.db")
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self._init_tables()
 
     def _init_tables(self):
         cursor = self.conn.cursor()
@@ -410,9 +404,21 @@ def save_config(config):
         else:
             cursor.execute("SELECT * FROM trip_logs")
         return [TripLog(*row) for row in cursor.fetchall()]
-    
-    class VesselEditor(Gtk.Dialog):
-     def __init__(self, parent, db: Database, vessel: Optional[Vessel]=None):
+
+# NOTE: Don't indent this function inside any class!
+def save_config(config):
+    Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f)
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    return {}
+
+class VesselEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, vessel: Optional[Vessel]=None):
         title = "Edit Vessel" if vessel else "Add Vessel"
         super().__init__(title=title, parent=parent, flags=0)
         self.db = db
@@ -497,9 +503,9 @@ def save_config(config):
             current_location=self.location_entry.get_text(),
             notes=buffer.get_text(start, end, False)
         )
-    
-    class MaintenanceTaskEditor(Gtk.Dialog):
-     def __init__(self, parent, db: Database, task: Optional[MaintenanceTask]=None):
+
+class MaintenanceTaskEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, task: Optional[MaintenanceTask]=None):
         title = "Edit Task" if task else "Add Task"
         super().__init__(title=title, parent=parent, flags=0)
         self.db = db
@@ -605,9 +611,9 @@ def save_config(config):
             parts_required=parts_ids if parts_ids else None,
             instructions=buffer.get_text(start, end, False)
         )
-    
-    class InventoryEditor(Gtk.Dialog):
-     def __init__(self, parent, db: Database, item: Optional[InventoryItem]=None):
+
+class InventoryEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, item: Optional[InventoryItem]=None):
         title = "Edit Inventory" if item else "Add Inventory"
         super().__init__(title=title, parent=parent, flags=0)
         self.db = db
@@ -684,6 +690,7 @@ def save_config(config):
             unit_cost=float(self.unit_cost_entry.get_value()),
             specifications=buffer.get_text(start, end, False)
 )
+
 class TripLogEditor(Gtk.Dialog):
     def __init__(self, parent, db: Database, log: Optional[TripLog]=None):
         title = "Edit Trip" if log else "Add Trip"
@@ -765,10 +772,10 @@ class TripLogEditor(Gtk.Dialog):
             distance=float(self.distance_entry.get_value()),
             crew=self.crew_entry.get_text(),
             log_entries=buffer.get_text(start, end, False)
-        )   
-    
-    class SupplierEditor(Gtk.Dialog):
-     def __init__(self, parent, db: Database, supplier: Optional[Supplier]=None):
+        )
+
+class SupplierEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, supplier: Optional[Supplier]=None):
         title = "Edit Supplier" if supplier else "Add Supplier"
         super().__init__(title=title, parent=parent, flags=0)
         self.db = db
@@ -822,9 +829,9 @@ class TripLogEditor(Gtk.Dialog):
             email=self.email_entry.get_text(),
             notes=buffer.get_text(start, end, False)
         )
-    
-    class VesselKeeperApp:
-     def __init__(self):
+
+class VesselKeeperApp:
+    def __init__(self):
         self.db = Database()
         self.config = load_config()
         self.current_theme = self.config.get("theme", "light")
