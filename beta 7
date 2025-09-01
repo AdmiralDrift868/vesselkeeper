@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk
+import sqlite3
+import os
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Optional
+from enum import Enum, auto
+
+CONFIG_PATH = os.path.expanduser("~/.local/share/vesselkeeper/config.json")
+
+class Priority(Enum):
+    CRITICAL = auto()
+    HIGH = auto()
+    MEDIUM = auto()
+    LOW = auto()
+
+class IntervalType(Enum):
+    HOURS = auto()
+    DAYS = auto()
+    USAGE_CYCLES = auto()
+
+VESSEL_TYPES = [
+    "Motor Yacht", "Sailboat", "Fishing Vessel",
+    "RIB", "Catamaran", "Trawler", "Other"
+]
+
+SYSTEM_CATEGORIES = [
+    "Engine", "Electrical", "Hull", "Deck",
+    "Navigation", "Plumbing", "Safety", "Other"
+]
+
+@dataclass
+class Vessel:
+    id: Optional[int] = None
+    name: str = ""
+    registration: str = ""
+    vessel_type: str = ""
+    length: float = 0.0
+    beam: float = 0.0
+    draft: float = 0.0
+    engine_model: str = ""
+    engine_hours: float = 0.0
+    hull_material: str = ""
+    build_year: int = 0
+    last_survey: str = ""
+    insurance_expiry: str = ""
+    current_location: str = ""
+    notes: str = ""
+
+@dataclass
+class MaintenanceTask:
+    id: Optional[int] = None
+    vessel_id: int = 0
+    vessel_name: str = ""
+    system: str = ""
+    task_name: str = ""
+    template_id: Optional[int] = None
+    interval_type: IntervalType = IntervalType.HOURS
+    interval_value: int = 0
+    last_completed: str = ""
+    last_hours: float = 0.0
+    next_due: str = ""
+    priority: Priority = Priority.MEDIUM
+    parts_required: List[int] = None
+    instructions: str = ""
+
+@dataclass
+class InventoryItem:
+    id: Optional[int] = None
+    name: str = ""
+    part_number: str = ""
+    category: str = ""
+    system: str = ""
+    location: str = ""
+    current_stock: int = 0
+    minimum_stock: int = 0
+    supplier: str = ""
+    unit_cost: float = 0.0
+    specifications: str = ""
+
+@dataclass
+class TripLog:
+    id: Optional[int] = None
+    vessel_id: int = 0
+    departure: str = ""
+    arrival: str = ""
+    origin: str = ""
+    destination: str = ""
+    start_hours: float = 0.0
+    end_hours: float = 0.0
+    fuel_used: float = 0.0
+    distance: float = 0.0
+    crew: str = ""
+    log_entries: str = ""
+
+@dataclass
+class Supplier:
+    id: Optional[int] = None
+    name: str = ""
+    contact: str = ""
+    phone: str = ""
+    email: str = ""
+    notes: str = ""
+
+class Database:
+    # --- Suppliers ---
+    def add_supplier(self, supplier: Supplier) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO suppliers (name, contact, phone, email, notes)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            supplier.name, supplier.contact, supplier.phone, supplier.email, supplier.notes
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_supplier(self, supplier: Supplier):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE suppliers SET name=?, contact=?, phone=?, email=?, notes=? WHERE id=?
+        """, (
+            supplier.name, supplier.contact, supplier.phone, supplier.email, supplier.notes, supplier.id
+        ))
+        self.conn.commit()
+
+    def delete_supplier(self, supplier_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM suppliers WHERE id=?", (supplier_id,))
+        self.conn.commit()
+
+    def get_suppliers(self) -> List[Supplier]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM suppliers")
+        return [Supplier(*row) for row in cursor.fetchall()]
+
+    def __init__(self):
+        self.db_path = os.path.expanduser("~/.local/share/vesselkeeper/data.db")
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self._init_tables()
+
+    def _init_tables(self):
+        cursor = self.conn.cursor()
+        cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS vessels (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            registration TEXT,
+            vessel_type TEXT,
+            length REAL,
+            beam REAL,
+            draft REAL,
+            engine_model TEXT,
+            engine_hours REAL DEFAULT 0,
+            hull_material TEXT,
+            build_year INTEGER,
+            last_survey TEXT,
+            insurance_expiry TEXT,
+            current_location TEXT,
+            notes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS maintenance_tasks (
+            id INTEGER PRIMARY KEY,
+            vessel_id INTEGER REFERENCES vessels(id),
+            system TEXT,
+            task_name TEXT NOT NULL,
+            template_id INTEGER,
+            interval_type TEXT,
+            interval_value INTEGER,
+            last_completed TEXT,
+            last_hours REAL,
+            next_due TEXT,
+            priority TEXT,
+            parts_required TEXT,
+            instructions TEXT
+        );
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            part_number TEXT,
+            category TEXT,
+            system TEXT,
+            location TEXT,
+            current_stock INTEGER DEFAULT 0,
+            minimum_stock INTEGER DEFAULT 0,
+            supplier TEXT,
+            unit_cost REAL DEFAULT 0,
+            specifications TEXT
+        );
+        CREATE TABLE IF NOT EXISTS trip_logs (
+            id INTEGER PRIMARY KEY,
+            vessel_id INTEGER REFERENCES vessels(id),
+            departure TEXT NOT NULL,
+            arrival TEXT,
+            origin TEXT,
+            destination TEXT,
+            start_hours REAL,
+            end_hours REAL,
+            fuel_used REAL,
+            distance REAL,
+            crew TEXT,
+            log_entries TEXT
+        );
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            contact TEXT,
+            phone TEXT,
+            email TEXT,
+            notes TEXT
+        );
+        """)
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception as e:
+            print(f"Error closing DB: {e}")
+
+    # --- Vessels ---
+    def add_vessel(self, vessel: Vessel) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO vessels (name, registration, vessel_type, length, beam, draft, engine_model, engine_hours, hull_material, build_year, last_survey, insurance_expiry, current_location, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            vessel.name, vessel.registration, vessel.vessel_type,
+            vessel.length, vessel.beam, vessel.draft, vessel.engine_model,
+            vessel.engine_hours, vessel.hull_material, vessel.build_year,
+            vessel.last_survey, vessel.insurance_expiry, vessel.current_location, vessel.notes
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_vessel(self, vessel: Vessel):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE vessels SET name=?, registration=?, vessel_type=?, length=?, beam=?, draft=?, engine_model=?, engine_hours=?, hull_material=?, build_year=?, last_survey=?, insurance_expiry=?, current_location=?, notes=? WHERE id=?
+        """, (
+            vessel.name, vessel.registration, vessel.vessel_type, vessel.length,
+            vessel.beam, vessel.draft, vessel.engine_model, vessel.engine_hours,
+            vessel.hull_material, vessel.build_year, vessel.last_survey,
+            vessel.insurance_expiry, vessel.current_location, vessel.notes, vessel.id
+        ))
+        self.conn.commit()
+
+    def delete_vessel(self, vessel_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM vessels WHERE id=?", (vessel_id,))
+        self.conn.commit()
+
+    def get_vessels(self) -> List[Vessel]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM vessels")
+        return [Vessel(*row) for row in cursor.fetchall()]
+
+    # --- Maintenance ---
+    def add_maintenance_task(self, task: MaintenanceTask) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO maintenance_tasks (vessel_id, system, task_name, template_id, interval_type, interval_value, last_completed, last_hours, next_due, priority, parts_required, instructions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task.vessel_id, task.system, task.task_name, task.template_id,
+            task.interval_type.name if task.interval_type else None, task.interval_value,
+            task.last_completed, task.last_hours, task.next_due,
+            task.priority.name if task.priority else None,
+            json.dumps(task.parts_required) if task.parts_required else None,
+            task.instructions
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_maintenance_task(self, task: MaintenanceTask):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE maintenance_tasks SET vessel_id=?, system=?, task_name=?, template_id=?, interval_type=?, interval_value=?, last_completed=?, last_hours=?, next_due=?, priority=?, parts_required=?, instructions=? WHERE id=?
+        """, (
+            task.vessel_id, task.system, task.task_name, task.template_id,
+            task.interval_type.name if task.interval_type else None, task.interval_value,
+            task.last_completed, task.last_hours, task.next_due,
+            task.priority.name if task.priority else None,
+            json.dumps(task.parts_required) if task.parts_required else None,
+            task.instructions, task.id
+        ))
+        self.conn.commit()
+
+    def delete_maintenance_task(self, task_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM maintenance_tasks WHERE id=?", (task_id,))
+        self.conn.commit()
+
+    def get_maintenance_tasks(self, vessel_id: Optional[int] = None) -> List[MaintenanceTask]:
+        cursor = self.conn.cursor()
+        if vessel_id:
+            cursor.execute("""
+                SELECT mt.*, v.name FROM maintenance_tasks mt
+                JOIN vessels v ON mt.vessel_id = v.id WHERE mt.vessel_id = ?
+            """, (vessel_id,))
+        else:
+            cursor.execute("""
+                SELECT mt.*, v.name FROM maintenance_tasks mt
+                JOIN vessels v ON mt.vessel_id = v.id
+            """)
+        tasks = []
+        for row in cursor.fetchall():
+            tasks.append(MaintenanceTask(
+                id=row[0],
+                vessel_id=row[1],
+                vessel_name=row[13],
+                system=row[2],
+                task_name=row[3],
+                template_id=row[4],
+                interval_type=IntervalType[row[5]] if row[5] else IntervalType.HOURS,
+                interval_value=row[6],
+                last_completed=row[7],
+                last_hours=row[8],
+                next_due=row[9],
+                priority=Priority[row[10]] if row[10] else Priority.MEDIUM,
+                parts_required=json.loads(row[11]) if row[11] else None,
+                instructions=row[12]
+            ))
+        return tasks
+
+    # --- Inventory ---
+    def add_inventory_item(self, item: InventoryItem) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO inventory (name, part_number, category, system, location, current_stock, minimum_stock, supplier, unit_cost, specifications)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            item.name, item.part_number, item.category, item.system,
+            item.location, item.current_stock, item.minimum_stock,
+            item.supplier, item.unit_cost, item.specifications
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_inventory_item(self, item: InventoryItem):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE inventory SET name=?, part_number=?, category=?, system=?, location=?, current_stock=?, minimum_stock=?, supplier=?, unit_cost=?, specifications=? WHERE id=?
+        """, (
+            item.name, item.part_number, item.category, item.system,
+            item.location, item.current_stock, item.minimum_stock,
+            item.supplier, item.unit_cost, item.specifications, item.id
+        ))
+        self.conn.commit()
+
+    def delete_inventory_item(self, item_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM inventory WHERE id=?", (item_id,))
+        self.conn.commit()
+
+    def get_inventory(self, low_stock_only: bool = False) -> List[InventoryItem]:
+        cursor = self.conn.cursor()
+        if low_stock_only:
+            cursor.execute("SELECT * FROM inventory WHERE current_stock <= minimum_stock")
+        else:
+            cursor.execute("SELECT * FROM inventory")
+        return [InventoryItem(*row) for row in cursor.fetchall()]
+
+    # --- Trips ---
+    def add_trip_log(self, log: TripLog) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO trip_logs (vessel_id, departure, arrival, origin, destination, start_hours, end_hours, fuel_used, distance, crew, log_entries)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            log.vessel_id, log.departure, log.arrival, log.origin,
+            log.destination, log.start_hours, log.end_hours, log.fuel_used,
+            log.distance, log.crew, log.log_entries
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_trip_log(self, log: TripLog):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE trip_logs SET vessel_id=?, departure=?, arrival=?, origin=?, destination=?, start_hours=?, end_hours=?, fuel_used=?, distance=?, crew=?, log_entries=? WHERE id=?
+        """, (
+            log.vessel_id, log.departure, log.arrival, log.origin,
+            log.destination, log.start_hours, log.end_hours, log.fuel_used,
+            log.distance, log.crew, log.log_entries, log.id
+        ))
+        self.conn.commit()
+
+    def delete_trip_log(self, trip_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM trip_logs WHERE id=?", (trip_id,))
+        self.conn.commit()
+
+    def get_trip_logs(self, vessel_id: Optional[int] = None) -> List[TripLog]:
+        cursor = self.conn.cursor()
+        if vessel_id:
+            cursor.execute("SELECT * FROM trip_logs WHERE vessel_id = ?", (vessel_id,))
+        else:
+            cursor.execute("SELECT * FROM trip_logs")
+        return [TripLog(*row) for row in cursor.fetchall()]
+
+# NOTE: Don't indent this function inside any class!
+def save_config(config):
+    Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f)
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    return {}
+
+# Utility for error dialogs
+def show_error_dialog(parent, message):
+    dialog = Gtk.MessageDialog(
+        parent=parent,
+        flags=0,
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.OK,
+        text=message,
+    )
+    dialog.run()
+    dialog.destroy()
+
+# About dialog
+def show_about_dialog(parent):
+    about = Gtk.AboutDialog(transient_for=parent, modal=True)
+    about.set_program_name("VesselKeeper")
+    about.set_version("1.0")
+    about.set_comments("Vessel management and maintenance application.")
+    about.set_website("https://github.com/yourrepo/vesselkeeper")
+    about.run()
+    about.destroy()
+
+class VesselEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, vessel: Optional[Vessel]=None):
+        title = "Edit Vessel" if vessel else "Add Vessel"
+        super().__init__(title=title, parent=parent, flags=0)
+        self.db = db
+        self.vessel = vessel
+        self.set_default_size(500, 600)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        content = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        self.name_entry = self._add_form_field(grid, 0, "Name:", Gtk.Entry())
+        self.registration_entry = self._add_form_field(grid, 1, "Registration:", Gtk.Entry())
+        self.type_combo = Gtk.ComboBoxText()
+        for vt in VESSEL_TYPES:
+            self.type_combo.append_text(vt)
+        self._add_form_field(grid, 2, "Type:", self.type_combo)
+        self.length_entry = self._add_form_field(grid, 3, "Length (m):", Gtk.SpinButton.new_with_range(0, 100, 0.1))
+        self.beam_entry = self._add_form_field(grid, 4, "Beam (m):", Gtk.SpinButton.new_with_range(0, 20, 0.1))
+        self.draft_entry = self._add_form_field(grid, 5, "Draft (m):", Gtk.SpinButton.new_with_range(0, 10, 0.1))
+        self.engine_model_entry = self._add_form_field(grid, 6, "Engine Model:", Gtk.Entry())
+        self.engine_hours_entry = self._add_form_field(grid, 7, "Engine Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.hull_material_entry = self._add_form_field(grid, 8, "Hull Material:", Gtk.Entry())
+        self.build_year_entry = self._add_form_field(grid, 9, "Build Year:", Gtk.SpinButton.new_with_range(1900, 2100, 1))
+        self.last_survey_entry = self._add_form_field(grid, 10, "Last Survey:", Gtk.Entry())
+        self.insurance_expiry_entry = self._add_form_field(grid, 11, "Insurance Expiry:", Gtk.Entry())
+        self.location_entry = self._add_form_field(grid, 12, "Current Location:", Gtk.Entry())
+        self.notes_entry = self._add_form_field(grid, 13, "Notes:", Gtk.TextView(), multiline=True)
+
+        if self.vessel:
+            self._load_existing_data()
+        content.pack_start(grid, True, True, 0)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        if self.vessel:
+            self.add_button("Delete", Gtk.ResponseType.DELETE_EVENT)
+
+    def _add_form_field(self, grid, row, label, widget, multiline=False):
+        grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+        if multiline:
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(80)
+            scroll.add(widget)
+            grid.attach(scroll, 1, row, 1, 1)
+        else:
+            grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def _load_existing_data(self):
+        self.name_entry.set_text(self.vessel.name)
+        self.registration_entry.set_text(self.vessel.registration)
+        self.type_combo.set_active(VESSEL_TYPES.index(self.vessel.vessel_type) if self.vessel.vessel_type in VESSEL_TYPES else 0)
+        self.length_entry.set_value(self.vessel.length)
+        self.beam_entry.set_value(self.vessel.beam)
+        self.draft_entry.set_value(self.vessel.draft)
+        self.engine_model_entry.set_text(self.vessel.engine_model)
+        self.engine_hours_entry.set_value(self.vessel.engine_hours)
+        self.hull_material_entry.set_text(self.vessel.hull_material)
+        self.build_year_entry.set_value(self.vessel.build_year)
+        self.last_survey_entry.set_text(self.vessel.last_survey)
+        self.insurance_expiry_entry.set_text(self.vessel.insurance_expiry)
+        self.location_entry.set_text(self.vessel.current_location)
+        buffer = self.notes_entry.get_buffer()
+        buffer.set_text(self.vessel.notes)
+
+    def get_vessel_data(self) -> Vessel:
+        buffer = self.notes_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        return Vessel(
+            id=self.vessel.id if self.vessel else None,
+            name=self.name_entry.get_text(),
+            registration=self.registration_entry.get_text(),
+            vessel_type=self.type_combo.get_active_text(),
+            length=float(self.length_entry.get_value()),
+            beam=float(self.beam_entry.get_value()),
+            draft=float(self.draft_entry.get_value()),
+            engine_model=self.engine_model_entry.get_text(),
+            engine_hours=float(self.engine_hours_entry.get_value()),
+            hull_material=self.hull_material_entry.get_text(),
+            build_year=int(self.build_year_entry.get_value()),
+            last_survey=self.last_survey_entry.get_text(),
+            insurance_expiry=self.insurance_expiry_entry.get_text(),
+            current_location=self.location_entry.get_text(),
+            notes=buffer.get_text(start, end, False)
+        )
+
+    def validate(self):
+        if not self.name_entry.get_text().strip():
+            show_error_dialog(self, "Vessel name is required.")
+            return False
+        return True
+
+class MaintenanceTaskEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, task: Optional[MaintenanceTask]=None):
+        title = "Edit Task" if task else "Add Task"
+        super().__init__(title=title, parent=parent, flags=0)
+        self.db = db
+        self.task = task
+        self.set_default_size(600, 600)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        content = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        self.vessels = self.db.get_vessels()
+        self.vessel_combo = Gtk.ComboBoxText()
+        for vessel in self.vessels:
+            self.vessel_combo.append_text(f"{vessel.name} ({vessel.registration})")
+        self._add_form_field(grid, 0, "Vessel:", self.vessel_combo)
+        self.task_entry = self._add_form_field(grid, 1, "Task Name:", Gtk.Entry())
+        self.system_combo = Gtk.ComboBoxText()
+        for system in SYSTEM_CATEGORIES:
+            self.system_combo.append_text(system)
+        self._add_form_field(grid, 2, "System:", self.system_combo)
+        self.template_id_entry = self._add_form_field(grid, 3, "Template ID:", Gtk.SpinButton.new_with_range(0, 100000, 1))
+        self.interval_type_combo = Gtk.ComboBoxText()
+        for itype in IntervalType:
+            self.interval_type_combo.append_text(itype.name)
+        self._add_form_field(grid, 4, "Interval Type:", self.interval_type_combo)
+        self.interval_value_entry = self._add_form_field(grid, 5, "Interval Value:", Gtk.SpinButton.new_with_range(1, 365, 1))
+        self.last_completed_entry = self._add_form_field(grid, 6, "Last Completed:", Gtk.Entry())
+        self.last_hours_entry = self._add_form_field(grid, 7, "Last Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.next_due_entry = self._add_form_field(grid, 8, "Next Due:", Gtk.Entry())
+        self.priority_combo = Gtk.ComboBoxText()
+        for priority in Priority:
+            self.priority_combo.append_text(priority.name)
+        self._add_form_field(grid, 9, "Priority:", self.priority_combo)
+
+        # Parts selection (multi-select)
+        self.inventory = self.db.get_inventory()
+        self.parts_store = Gtk.ListStore(int, str)
+        for part in self.inventory:
+            self.parts_store.append([part.id, part.name])
+        self.parts_view = Gtk.TreeView(model=self.parts_store)
+        renderer = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn("Part Name", renderer, text=1)
+        self.parts_view.append_column(column)
+        self.parts_view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_min_content_height(80)
+        scroll.add(self.parts_view)
+        grid.attach(Gtk.Label(label="Parts Required:", xalign=0), 0, 10, 1, 1)
+        grid.attach(scroll, 1, 10, 1, 1)
+        self.instructions_entry = self._add_form_field(grid, 11, "Instructions:", Gtk.TextView(), multiline=True)
+
+        if self.task:
+            self._load_existing_data()
+        content.pack_start(grid, True, True, 0)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        if self.task:
+            self.add_button("Delete", Gtk.ResponseType.DELETE_EVENT)
+
+    def _add_form_field(self, grid, row, label, widget, multiline=False):
+        grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+        if multiline:
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(80)
+            scroll.add(widget)
+            grid.attach(scroll, 1, row, 1, 1)
+        else:
+            grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def _load_existing_data(self):
+        for idx, vessel in enumerate(self.vessels):
+            if vessel.id == self.task.vessel_id:
+                self.vessel_combo.set_active(idx)
+                break
+        self.task_entry.set_text(self.task.task_name)
+        if self.task.system in SYSTEM_CATEGORIES:
+            self.system_combo.set_active(SYSTEM_CATEGORIES.index(self.task.system))
+        self.template_id_entry.set_value(self.task.template_id if self.task.template_id else 0)
+        self.interval_type_combo.set_active([v.name for v in IntervalType].index(self.task.interval_type.name))
+        self.interval_value_entry.set_value(self.task.interval_value)
+        self.last_completed_entry.set_text(self.task.last_completed)
+        self.last_hours_entry.set_value(self.task.last_hours)
+        self.next_due_entry.set_text(self.task.next_due)
+        self.priority_combo.set_active([p.name for p in Priority].index(self.task.priority.name))
+        # Parts selection (multi-select)
+        if self.task.parts_required:
+            selection = self.parts_view.get_selection()
+            selection.unselect_all()
+            for idx, part in enumerate(self.inventory):
+                if part.id in self.task.parts_required:
+                    selection.select_path(idx)
+
+    def get_task_data(self) -> MaintenanceTask:
+        buffer = self.instructions_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        vessel_idx = self.vessel_combo.get_active()
+        vessel_id = self.vessels[vessel_idx].id if vessel_idx >= 0 else None
+        # Multi-select parts
+        selection = self.parts_view.get_selection()
+        model, paths = selection.get_selected_rows()
+        parts_ids = [self.inventory[path.get_indices()[0]].id for path in paths]
+        return MaintenanceTask(
+            id=self.task.id if self.task else None,
+            vessel_id=vessel_id,
+            vessel_name=self.vessel_combo.get_active_text(),
+            system=self.system_combo.get_active_text(),
+            task_name=self.task_entry.get_text(),
+            template_id=int(self.template_id_entry.get_value()) if self.template_id_entry.get_value() else None,
+            interval_type=IntervalType[self.interval_type_combo.get_active_text()] if self.interval_type_combo.get_active_text() else IntervalType.HOURS,
+            interval_value=int(self.interval_value_entry.get_value()),
+            last_completed=self.last_completed_entry.get_text(),
+            last_hours=float(self.last_hours_entry.get_value()),
+            next_due=self.next_due_entry.get_text(),
+            priority=Priority[self.priority_combo.get_active_text()] if self.priority_combo.get_active_text() else Priority.MEDIUM,
+            parts_required=parts_ids if parts_ids else None,
+            instructions=buffer.get_text(start, end, False)
+        )
+
+    def validate(self):
+        if self.vessel_combo.get_active() < 0:
+            show_error_dialog(self, "Please select a vessel.")
+            return False
+        if not self.task_entry.get_text().strip():
+            show_error_dialog(self, "Task name is required.")
+            return False
+        return True
+
+class InventoryEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, item: Optional[InventoryItem]=None):
+        title = "Edit Inventory" if item else "Add Inventory"
+        super().__init__(title=title, parent=parent, flags=0)
+        self.db = db
+        self.item = item
+        self.set_default_size(500, 600)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        content = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        self.name_entry = self._add_form_field(grid, 0, "Name:", Gtk.Entry())
+        self.part_entry = self._add_form_field(grid, 1, "Part Number:", Gtk.Entry())
+        self.category_entry = self._add_form_field(grid, 2, "Category:", Gtk.Entry())
+        self.system_entry = self._add_form_field(grid, 3, "System:", Gtk.Entry())
+        self.location_entry = self._add_form_field(grid, 4, "Location:", Gtk.Entry())
+        self.stock_entry = self._add_form_field(grid, 5, "Current Stock:", Gtk.SpinButton.new_with_range(0, 1000, 1))
+        self.min_stock_entry = self._add_form_field(grid, 6, "Minimum Stock:", Gtk.SpinButton.new_with_range(0, 1000, 1))
+        # Supplier selection
+        self.suppliers = self.db.get_suppliers()
+        self.supplier_combo = Gtk.ComboBoxText()
+        for supplier in self.suppliers:
+            self.supplier_combo.append_text(supplier.name)
+        self._add_form_field(grid, 7, "Supplier:", self.supplier_combo)
+        self.unit_cost_entry = self._add_form_field(grid, 8, "Unit Cost:", Gtk.SpinButton.new_with_range(0, 100000, 0.01))
+        self.spec_entry = self._add_form_field(grid, 9, "Specifications:", Gtk.TextView(), multiline=True)
+        if self.item:
+            self._load_existing_data()
+        content.pack_start(grid, True, True, 0)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        if self.item:
+            self.add_button("Delete", Gtk.ResponseType.DELETE_EVENT)
+
+    def _add_form_field(self, grid, row, label, widget, multiline=False):
+        grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+        if multiline:
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(60)
+            scroll.add(widget)
+            grid.attach(scroll, 1, row, 1, 1)
+        else:
+            grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def _load_existing_data(self):
+        self.name_entry.set_text(self.item.name)
+        self.part_entry.set_text(self.item.part_number)
+        self.category_entry.set_text(self.item.category)
+        self.system_entry.set_text(self.item.system)
+        self.location_entry.set_text(self.item.location)
+        self.stock_entry.set_value(self.item.current_stock)
+        self.min_stock_entry.set_value(self.item.minimum_stock)
+        if self.item.supplier:
+            idx = [s.name for s in self.suppliers].index(self.item.supplier) if self.item.supplier in [s.name for s in self.suppliers] else 0
+            self.supplier_combo.set_active(idx)
+        self.unit_cost_entry.set_value(self.item.unit_cost)
+        buffer = self.spec_entry.get_buffer()
+        buffer.set_text(self.item.specifications)
+
+    def get_item_data(self) -> InventoryItem:
+        buffer = self.spec_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        supplier = self.supplier_combo.get_active_text()
+        return InventoryItem(
+            id=self.item.id if self.item else None,
+            name=self.name_entry.get_text(),
+            part_number=self.part_entry.get_text(),
+            category=self.category_entry.get_text(),
+            system=self.system_entry.get_text(),
+            location=self.location_entry.get_text(),
+            current_stock=int(self.stock_entry.get_value()),
+            minimum_stock=int(self.min_stock_entry.get_value()),
+            supplier=supplier,
+            unit_cost=float(self.unit_cost_entry.get_value()),
+            specifications=buffer.get_text(start, end, False)
+)
+
+    def validate(self):
+        if not self.name_entry.get_text().strip():
+            show_error_dialog(self, "Inventory item name is required.")
+            return False
+        return True
+
+class TripLogEditor(Gtk.Dialog):
+    def __init__(self, parent, db: Database, log: Optional[TripLog]=None):
+        title = "Edit Trip" if log else "Add Trip"
+        super().__init__(title=title, parent=parent, flags=0)
+        self.db = db
+        self.log = log
+        self.set_default_size(500, 600)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        content = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        self.vessels = self.db.get_vessels()
+        self.vessel_combo = Gtk.ComboBoxText()
+        for vessel in self.vessels:
+            self.vessel_combo.append_text(f"{vessel.name} ({vessel.registration})")
+        self._add_form_field(grid, 0, "Vessel:", self.vessel_combo)
+        self.departure_entry = self._add_form_field(grid, 1, "Departure:", Gtk.Entry())
+        self.arrival_entry = self._add_form_field(grid, 2, "Arrival:", Gtk.Entry())
+        self.origin_entry = self._add_form_field(grid, 3, "Origin:", Gtk.Entry())
+        self.destination_entry = self._add_form_field(grid, 4, "Destination:", Gtk.Entry())
+        self.start_hours_entry = self._add_form_field(grid, 5, "Start Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.end_hours_entry = self._add_form_field(grid, 6, "End Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.fuel_used_entry = self._add_form_field(grid, 7, "Fuel Used (L/gal):", Gtk.SpinButton.new_with_range(0, 10000, 0.1))
+        self.distance_entry = self._add_form_field(grid, 8, "Distance (nm):", Gtk.SpinButton.new_with_range(0, 5000, 0.1))
+        self.crew_entry = self._add_form_field(grid, 9, "Crew:", Gtk.Entry())
+        self.log_entries_entry = self._add_form_field(grid, 10, "Log Entries:", Gtk.TextView(), multiline=True)
+        if self.log:
+            self._load_existing_data()
+        content.pack_start(grid, True, True, 0)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        if self.log:
+            self.add_button("Delete", Gtk.ResponseType.DELETE_EVENT)
+
+    def _add_form_field(self, grid, row, label, widget, multiline=False):
+        grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+        if multiline:
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(80)
+            scroll.add(widget)
+            grid.attach(scroll, 1, row, 1, 1)
+        else:
+            grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def _load_existing_data(self):
+        for idx, vessel in enumerate(self.vessels):
+            if vessel.id == self.log.vessel_id:
+                self.vessel_combo.set_active(idx)
+                break
+        self.departure_entry.set_text(self.log.departure)
+        self.arrival_entry.set_text(self.log.arrival)
+        self.origin_entry.set_text(self.log.origin)
+        self.destination_entry.set_text(self.log.destination)
+        self.start_hours_entry.set_value(self.log.start_hours)
+        self.end_hours_entry.set_value(self.log.end_hours)
+        self.fuel_used_entry.set_value(self.log.fuel_used)
+        self.distance_entry.set_value(self.log.distance)
+        self.crew_entry.set_text(self.log.crew)
+        buffer = self.log_entries_entry.get_buffer()
+        buffer.set_text(self.log.log_entries)
+
+    def get_log_data(self) -> TripLog:
+        buffer = self.log_entries_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        vessel_idx = self.vessel_combo.get_active()
+        vessel_id = self.vessels[vessel_idx].id if vessel_idx >= 0 else None
+        return TripLog(
+            id=self.log.id if self.log else None,
+            vessel_id=vessel_id,
+            departure=self.departure_entry.get_text(),
+            arrival=self.arrival_entry.get_text(),
+            origin=self.origin_entry.get_text(),
+            destination=self.destination_entry.get_text(),
+            start_hours=float(self.start_hours_entry.get_value()),
+            end_hours=float(self.end_hours_entry.get_value()),
+            fuel_used=float(self.fuel_used_entry.get_value()),
+            distance=float(self.distance_entry.get_value()),
+            crew=self.crew_entry.get_text(),
+            log_entries=buffer.get_text(start, end, False)
+        )
+
+    def validate(self):
+        if self.vessel_combo.get_active() < 0:
+            show_error_dialog(self, "Please select a vessel.")
+            return False
+        if not self.departure_entry.get_text().strip():
+            show_error_dialog(self, "Departure date is required.")
+            return False
+        return True
