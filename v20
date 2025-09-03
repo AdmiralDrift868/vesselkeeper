@@ -277,7 +277,7 @@ class Database:
         self.conn.commit()
         vessel_id = cursor.lastrowid
         logger.info(f"Added vessel: {vessel.name} (ID: {vessel_id})")
-        return vessel_id
+        return vessel_id # type: ignore
     def update_vessel(self, vessel: Vessel):
         cursor = self.conn.cursor()
         cursor.execute("""
