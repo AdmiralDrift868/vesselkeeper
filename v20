@@ -170,6 +170,13 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         # Enable foreign key constraints
         self.conn.execute("PRAGMA foreign_keys = ON;")
+        # --- ADD THIS CHECK ---
+        fk_status = self.conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+        if fk_status != 1:
+            logger.warning("Foreign key constraints are NOT enabled!")
+        else:
+            logger.debug("Foreign key constraints are enabled.")
+        # --- END ADDITION ---
         self._init_tables()
     def _init_tables(self):
         cursor = self.conn.cursor()
@@ -438,13 +445,32 @@ class Database:
         cursor.execute("DELETE FROM inventory WHERE id=?", (item_id,))
         self.conn.commit()
         logger.info(f"Deleted inventory item ID: {item_id}")
+        # --- Inventory ---
     def get_inventory(self, low_stock_only: bool = False) -> List[InventoryItem]:
         cursor = self.conn.cursor()
+        query = "SELECT id, name, part_number, category, system, location, current_stock, minimum_stock, supplier_id, unit_cost, specifications FROM inventory"
         if low_stock_only:
-            cursor.execute("SELECT * FROM inventory WHERE current_stock <= minimum_stock")
-        else:
-            cursor.execute("SELECT * FROM inventory")
-        return [InventoryItem(**dict(row)) for row in cursor.fetchall()]
+            query += " WHERE current_stock <= minimum_stock"
+        cursor.execute(query)
+        items = []
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            # Explicitly map the database column name 'supplier_id' to the dataclass field 'supplier_id'
+            # This prevents issues if the column name was somehow misinterpreted or if using **
+            items.append(InventoryItem(
+                id=row_dict.get('id'),
+                name=row_dict.get('name', ''),
+                part_number=row_dict.get('part_number', ''),
+                category=row_dict.get('category', ''),
+                system=row_dict.get('system', ''),
+                location=row_dict.get('location', ''),
+                current_stock=row_dict.get('current_stock', 0),
+                minimum_stock=row_dict.get('minimum_stock', 0),
+                supplier_id=row_dict.get('supplier_id'), # Correctly use the column name
+                unit_cost=row_dict.get('unit_cost', 0.0),
+                specifications=row_dict.get('specifications', '')
+            ))
+        return items
     # --- Trips ---
     def add_trip_log(self, log: TripLog) -> int:
         cursor = self.conn.cursor()
@@ -614,8 +640,8 @@ class DatePickerEntry(Gtk.Box):
         self.pack_start(self.entry, True, True, 0)
         self.popover = Gtk.Popover()
         self.calendar = Gtk.Calendar()
-        # Use correct signal name
-        # --- FIX 1: Corrected signal connection ---
+        # Use correct signal name (was already correct)
+        # --- FIX 1: Signal connection is correct ---
         self.calendar.connect("day-selected", self.on_calendar_day_selected) # type: ignore
         self.popover.add(self.calendar)
         button = Gtk.Button()
@@ -625,6 +651,7 @@ class DatePickerEntry(Gtk.Box):
         self.pack_start(button, False, False, 0)
         self.popover.set_relative_to(button)
         button.connect("clicked", lambda b: self.popover.show_all())
+        
     def on_calendar_day_selected(self, calendar: Gtk.Calendar):
         year, month, day = calendar.get_date()
         selected_date = datetime.date(year, month + 1, day)  # month is 0-based in get_date
