@@ -2535,16 +2535,34 @@ class VesselKeeperApp(Gtk.ApplicationWindow):
 
     # --- Helper Functions ---
     def _get_selected_item(self, tree_view, store):
-        """Get the selected item from a tree view."""
-        selection = tree_view.get_selection()
-        model, tree_iter = selection.get_selected()
-        if tree_iter:
-            # Convert filtered model iter to master store iter if needed
+    """Get the selected item ID from a tree view."""
+    selection = tree_view.get_selection()
+    model, tree_iter = selection.get_selected() # model could be the filter or the store
+    if tree_iter is not None:
+        try:
+            # Check if the model is a filter and convert iter if necessary
+            # This is the safer way using the model's own method
             if hasattr(model, 'convert_iter_to_child_iter'):
-                tree_iter = model.convert_iter_to_child_iter(tree_iter)
-            item_id = model[tree_iter][0] # ID is in the first column
-            return item_id
-        return None
+                # It's a filter model, convert the iter
+                child_iter = model.convert_iter_to_child_iter(tree_iter)
+                # Get the ID from the underlying store (which should be 'store' passed in)
+                # Assuming ID is in column 0
+                item_id = store[child_iter][0] # Use the passed 'store' and converted iter
+            else:
+                # It's likely the direct store model
+                item_id = model[tree_iter][0] # Assuming ID is in column 0
+
+            # Ensure ID is an integer (handle potential None)
+            if item_id is not None:
+                return int(item_id)
+            else:
+                logger.warning("Selected item ID is None.")
+                return None
+        except (ValueError, TypeError, IndexError) as e:
+            logger.error(f"Error retrieving ID from selected item: {e}")
+            show_error_dialog(tree_view.get_toplevel(), "Could not identify the selected item.")
+            return None
+    return None
 
     def _handle_edit(self, editor_class, get_items_func, add_func, update_func, delete_func, item_id=None):
         """Generic handler for add/edit/delete operations."""
