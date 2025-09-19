@@ -1229,9 +1229,9 @@ class VesselEditor(BaseEditor):
 
     def _populate_fields(self):
         self.name_entry.set_text(self.item.name)
-        # Set combo box active item
-        if self.item.vessel_type in VESSEL_TYPES:
-            index = VESSEL_TYPES.index(self.item.vessel_type)
+        # Set combo box active item - Corrected field name
+        if self.item.vessel_type in VESSEL_TYPES: # <-- Use vessel_type
+            index = VESSEL_TYPES.index(self.item.vessel_type) # <-- Use vessel_type
             self.type_combo.set_active(index)
         
         self.length_entry.set_value(self.item.length)
@@ -1255,7 +1255,7 @@ class VesselEditor(BaseEditor):
         text_buffer = self.notes_entry.get_buffer()
         start_iter, end_iter = text_buffer.get_bounds()
         
-        # Get selected type from combo
+        # Get selected type from combo - Corrected variable name
         selected_type = ""
         active_index = self.type_combo.get_active()
         if active_index >= 0 and active_index < len(VESSEL_TYPES):
@@ -1264,7 +1264,7 @@ class VesselEditor(BaseEditor):
         return Vessel(
             id=self.item.id if self.item else None,
             name=self.name_entry.get_text().strip(),
-            vessel_type=selected_type,
+            vessel_type=selected_type, # <-- Use vessel_type field name
             length=self.length_entry.get_value(),
             beam=self.beam_entry.get_value(),
             draft=self.draft_entry.get_value(),
