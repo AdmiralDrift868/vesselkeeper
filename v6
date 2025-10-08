@@ -1,7 +1,9 @@
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+"""
+Vessel Keeper - A comprehensive marine vessel maintenance and inventory management application.
+Refined Version - Addresses review points while preserving functionality and restoring original dashboard appearance.
+"""
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0') # For text formatting in reports
@@ -477,6 +479,14 @@ class BaseEditor(Gtk.Dialog):
             return Gtk.ResponseType.CANCEL # Re-run if validation fails
         return result
 
+    def _add_form_field(self, row: int, label_text: str, widget: Gtk.Widget):
+        """Correctly adds a label and widget to the grid."""
+        label = Gtk.Label(label=label_text)
+        label.set_xalign(0)  # Align label to the left
+        self.grid.attach(label, 0, row, 1, 1) # Attach label to column 0
+        self.grid.attach(widget, 1, row, 1, 1) # Attach widget to column 1
+        return widget # Return the widget for potential further configuration, like grab_focus
+
 class BaseListManager:
     """Base class for managing lists of items."""
     def __init__(self, db, tree_view: Gtk.TreeView, store: Gtk.ListStore, item_class):
@@ -588,6 +598,11 @@ class DatePickerEntry(Gtk.Box):
 class AttachmentWidget(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        # Use individual margin setters instead of set_margin or set_border_width
+        self.set_margin_start(5)
+        self.set_margin_end(5)
+        self.set_margin_top(5)
+        self.set_margin_bottom(5)
         self.attachments = []
         self.list_store = Gtk.ListStore(str) # Path
         self.tree_view = Gtk.TreeView(model=self.list_store)
@@ -831,8 +846,26 @@ class Database:
         rows = cursor.fetchall()
         vessels = []
         for row in rows:
-            # Safely get values, defaulting to appropriate empty values for potential NULLs
+            # Safely get values, defaulting to appropriate empty values for potential NULLs or missing columns
             # This ensures the Vessel object is created without any None string fields
+            # Handle potentially missing columns by catching IndexError
+            try:
+                registration_number = row['registration_number'] or ''
+            except IndexError:
+                registration_number = ''
+            try:
+                home_port = row['home_port'] or ''
+            except IndexError:
+                home_port = ''
+            try:
+                gross_tonnage = float(row['gross_tonnage']) if row['gross_tonnage'] is not None else 0.0
+            except (IndexError, ValueError, TypeError):
+                gross_tonnage = 0.0
+            try:
+                image_path = row['image_path'] or ''
+            except IndexError:
+                image_path = ''
+
             vessel = Vessel(
                 id=row['id'],
                 name=row['name'] or '', # Handles potential None
@@ -850,13 +883,11 @@ class Database:
                 current_location=row['current_location'] or '', # Handles potential None
                 notes=row['notes'] or '', # Handles potential None
                 attachments=json.loads(row['attachments']) if row['attachments'] and row['attachments'] != 'null' else [], # Handles potential None or 'null' string
-                # Safely get optional fields, defaulting if they are None or missing (using row.get with default)
-                # Note: row.get is not used here for existing columns as row['key'] is expected to exist now.
-                # row.get is better for *newer* columns that might not exist in an old DB schema.
-                registration_number=row.get('registration_number', '') or '', # Handles potential None from .get or DB value
-                home_port=row.get('home_port', '') or '',
-                gross_tonnage=float(row.get('gross_tonnage', 0.0)) if row.get('gross_tonnage') is not None else 0.0,
-                image_path=row.get('image_path', '') or ''
+                # Use safely retrieved or default values for optional fields
+                registration_number=registration_number,
+                home_port=home_port,
+                gross_tonnage=gross_tonnage,
+                image_path=image_path
             )
             vessels.append(vessel)
         return vessels
@@ -1367,29 +1398,31 @@ class VesselEditor(BaseEditor):
         self.grid.attach(self.attachment_widget, 1, 18, 1, 1)
 
     def populate_fields(self):
-        self.name_entry.set_text(self.item.name)
+        # Use 'or ""' to ensure a string is passed to set_text, even if self.item.field is None after __post_init__/DB retrieval
+        self.name_entry.set_text(self.item.name or "")
         for i, vtype in enumerate(VESSEL_TYPES):
-            if vtype == self.item.vessel_type:
+            if vtype == (self.item.vessel_type or ""): # Ensure vessel_type is a string for comparison
                 self.type_combo.set_active(i)
                 break
         self.length_entry.set_value(self.item.length)
         self.beam_entry.set_value(self.item.beam)
         self.draft_entry.set_value(self.item.draft)
-        self.engine_make_entry.set_text(self.item.engine_make)
-        self.engine_model_entry.set_text(self.item.engine_model)
+        # Apply 'or ""' to all string fields passed to set_text
+        self.engine_make_entry.set_text(self.item.engine_make or "")
+        self.engine_model_entry.set_text(self.item.engine_model or "")
         self.engine_hours_entry.set_value(self.item.engine_hours)
-        self.hull_material_entry.set_text(self.item.hull_material)
+        self.hull_material_entry.set_text(self.item.hull_material or "")
         self.build_year_entry.set_value(self.item.build_year)
-        self.last_survey_entry.set_text(self.item.last_survey)
-        self.insurance_expiry_entry.set_text(self.item.insurance_expiry)
-        self.current_location_entry.set_text(self.item.current_location)
-        self.registration_number_entry.set_text(self.item.registration_number)
-        self.home_port_entry.set_text(self.item.home_port)
+        self.last_survey_entry.set_text(self.item.last_survey or "")
+        self.insurance_expiry_entry.set_text(self.item.insurance_expiry or "")
+        self.current_location_entry.set_text(self.item.current_location or "")
+        self.registration_number_entry.set_text(self.item.registration_number or "")
+        self.home_port_entry.set_text(self.item.home_port or "")
         self.gross_tonnage_entry.set_value(self.item.gross_tonnage)
-        self.image_path_entry.set_text(self.item.image_path)
+        self.image_path_entry.set_text(self.item.image_path or "")
 
         buffer = self.notes_textview.get_buffer()
-        buffer.set_text(self.item.notes)
+        buffer.set_text(self.item.notes or "") # Ensure notes is a string
 
         self.attachment_widget.set_attachments(self.item.attachments)
 
@@ -1513,15 +1546,15 @@ class InventoryItemEditor(BaseEditor):
         self.grid.attach(self.attachment_widget, 1, 14, 1, 1)
 
     def populate_fields(self):
-        self.name_entry.set_text(self.item.name)
-        self.part_number_entry.set_text(self.item.part_number)
-        self.description_entry.set_text(self.item.description)
-        self.category_entry.set_text(self.item.category)
+        self.name_entry.set_text(self.item.name or "")
+        self.part_number_entry.set_text(self.item.part_number or "")
+        self.description_entry.set_text(self.item.description or "")
+        self.category_entry.set_text(self.item.category or "")
         for i, system in enumerate(SYSTEM_CATEGORIES):
-            if system == self.item.system:
+            if system == (self.item.system or ""):
                 self.system_combo.set_active(i + 1) # +1 for "None"
                 break
-        self.location_entry.set_text(self.item.location)
+        self.location_entry.set_text(self.item.location or "")
         self.current_stock_entry.set_value(self.item.current_stock)
         self.minimum_stock_entry.set_value(self.item.minimum_stock)
         self.reorder_quantity_entry.set_value(self.item.reorder_quantity)
@@ -1538,10 +1571,10 @@ class InventoryItemEditor(BaseEditor):
         self.average_consumption_rate_entry.set_value(self.item.average_consumption_rate)
 
         buffer_specs = self.specifications_textview.get_buffer()
-        buffer_specs.set_text(self.item.specifications)
+        buffer_specs.set_text(self.item.specifications or "")
 
         buffer_notes = self.notes_textview.get_buffer()
-        buffer_notes.set_text(self.item.notes)
+        buffer_notes.set_text(self.item.notes or "")
 
         self.attachment_widget.set_attachments(self.item.attachments)
 
@@ -1700,10 +1733,10 @@ class MaintenanceTaskEditor(BaseEditor):
                 self.vessel_combo.set_active(i)
                 break
         for i, system in enumerate(SYSTEM_CATEGORIES):
-            if system == self.item.system:
+            if system == (self.item.system or ""):
                 self.system_combo.set_active(i + 1) # +1 for "None"
                 break
-        self.task_name_entry.set_text(self.item.task_name)
+        self.task_name_entry.set_text(self.item.task_name or "")
 
         # Set interval type in combo
         for i, interval_type in enumerate(IntervalType):
@@ -1711,9 +1744,9 @@ class MaintenanceTaskEditor(BaseEditor):
                 self.interval_type_combo.set_active(i)
                 break
         self.interval_value_entry.set_value(self.item.interval_value)
-        self.last_completed_entry.set_text(self.item.last_completed)
+        self.last_completed_entry.set_text(self.item.last_completed or "")
         self.last_hours_entry.set_value(self.item.last_hours)
-        self.next_due_entry.set_text(self.item.next_due)
+        self.next_due_entry.set_text(self.item.next_due or "")
 
         # Set priority in combo
         for i, priority in enumerate(Priority):
@@ -1727,15 +1760,15 @@ class MaintenanceTaskEditor(BaseEditor):
                 self.status_combo.set_active(i)
                 break
 
-        self.assigned_to_entry.set_text(self.item.assigned_to)
+        self.assigned_to_entry.set_text(self.item.assigned_to or "")
         self.estimated_duration_entry.set_value(self.item.estimated_duration_hours)
         self.labor_cost_entry.set_value(self.item.labor_cost)
 
         buffer = self.instructions_textview.get_buffer()
-        buffer.set_text(self.item.instructions)
+        buffer.set_text(self.item.instructions or "")
 
         buffer_notes = self.notes_textview.get_buffer()
-        buffer_notes.set_text(self.item.notes)
+        buffer_notes.set_text(self.item.notes or "")
 
         self.attachment_widget.set_attachments(self.item.attachments)
 
@@ -1863,17 +1896,17 @@ class SupplierEditor(BaseEditor):
         self.grid.attach(self.attachment_widget, 1, 9, 1, 1)
 
     def populate_fields(self):
-        self.name_entry.set_text(self.item.name)
-        self.contact_entry.set_text(self.item.contact)
-        self.phone_entry.set_text(self.item.phone)
-        self.email_entry.set_text(self.item.email)
-        self.address_entry.set_text(self.item.address)
-        self.website_entry.set_text(self.item.website)
-        self.terms_entry.set_text(self.item.terms)
+        self.name_entry.set_text(self.item.name or "")
+        self.contact_entry.set_text(self.item.contact or "")
+        self.phone_entry.set_text(self.item.phone or "")
+        self.email_entry.set_text(self.item.email or "")
+        self.address_entry.set_text(self.item.address or "")
+        self.website_entry.set_text(self.item.website or "")
+        self.terms_entry.set_text(self.item.terms or "")
         self.preferred_check.set_active(self.item.preferred)
 
         buffer = self.notes_textview.get_buffer()
-        buffer.set_text(self.item.notes)
+        buffer.set_text(self.item.notes or "")
 
         self.attachment_widget.set_attachments(self.item.attachments)
 
@@ -1973,24 +2006,24 @@ class TripLogEditor(BaseEditor):
             if vessel.id == self.item.vessel_id:
                 self.vessel_combo.set_active(i)
                 break
-        self.departure_entry.set_text(self.item.departure)
-        self.arrival_entry.set_text(self.item.arrival)
-        self.origin_entry.set_text(self.item.origin)
-        self.destination_entry.set_text(self.item.destination)
+        self.departure_entry.set_text(self.item.departure or "")
+        self.arrival_entry.set_text(self.item.arrival or "")
+        self.origin_entry.set_text(self.item.origin or "")
+        self.destination_entry.set_text(self.item.destination or "")
         self.start_hours_entry.set_value(self.item.start_hours)
         self.end_hours_entry.set_value(self.item.end_hours)
         self.fuel_used_entry.set_value(self.item.fuel_used)
         self.distance_entry.set_value(self.item.distance)
-        self.crew_entry.set_text(self.item.crew)
-        self.captain_entry.set_text(self.item.captain)
-        self.weather_entry.set_text(self.item.weather_conditions)
-        self.sea_state_entry.set_text(self.item.sea_state)
+        self.crew_entry.set_text(self.item.crew or "")
+        self.captain_entry.set_text(self.item.captain or "")
+        self.weather_entry.set_text(self.item.weather_conditions or "")
+        self.sea_state_entry.set_text(self.item.sea_state or "")
 
         buffer = self.log_entries_textview.get_buffer()
-        buffer.set_text(self.item.log_entries)
+        buffer.set_text(self.item.log_entries or "")
 
         buffer_notes = self.notes_textview.get_buffer()
-        buffer_notes.set_text(self.item.notes)
+        buffer_notes.set_text(self.item.notes or "")
 
         self.attachment_widget.set_attachments(self.item.attachments)
 
@@ -2099,11 +2132,11 @@ class StockTransactionEditor(BaseEditor):
                 self.type_combo.set_active(i)
                 break
         self.quantity_entry.set_value(self.item.quantity)
-        self.date_entry.set_text(self.item.date)
-        self.reference_entry.set_text(self.item.reference)
+        self.date_entry.set_text(self.item.date or "")
+        self.reference_entry.set_text(self.item.reference or "")
 
         buffer = self.notes_textview.get_buffer()
-        buffer.set_text(self.item.notes)
+        buffer.set_text(self.item.notes or "")
 
     def validate(self) -> bool:
         if self.quantity_entry.get_value_as_int() == 0:
@@ -2162,10 +2195,10 @@ class PerformanceMetricEditor(BaseEditor):
         self.date_entry = self._add_form_field(4, "Date Recorded:", DatePickerEntry())
 
     def populate_fields(self):
-        self.metric_name_entry.set_text(self.item.metric_name)
+        self.metric_name_entry.set_text(self.item.metric_name or "")
         self.value_entry.set_value(self.item.value)
-        self.unit_entry.set_text(self.item.unit)
-        self.date_entry.set_text(self.item.date_recorded)
+        self.unit_entry.set_text(self.item.unit or "")
+        self.date_entry.set_text(self.item.date_recorded or "")
 
     def validate(self) -> bool:
         if not self.metric_name_entry.get_text().strip():
@@ -2377,7 +2410,7 @@ class VesselKeeperApp(Gtk.Window):
         # Cell Data Function for Status Coloring
         status_column = self.upcoming_tree.get_column(4) # Status column is now index 4
         status_renderer = status_column.get_cells()[0]
-        status_column.set_cell_data_func(status_renderer, self._status_cell_data_func)
+        status_column.set_cell_data_func(status_renderer, self._status_cell_data_func_dashboard) # Use specific function
 
         # Add bold header label
         header_label = Gtk.Label()
@@ -2444,9 +2477,9 @@ class VesselKeeperApp(Gtk.Window):
             self.maintenance_tree.append_column(column)
 
         # Cell Data Function for Status Coloring
-        status_column = self.maintenance_tree.get_column(8) # Status column
+        status_column = self.maintenance_tree.get_column(8) # Status column is now index 8
         status_renderer = status_column.get_cells()[0]
-        status_column.set_cell_data_func(status_renderer, self._status_cell_data_func)
+        status_column.set_cell_data_func(status_renderer, self._status_cell_data_func_main) # Use specific function
 
         scrolled_window = Gtk.ScrolledWindow()
         scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -2541,8 +2574,23 @@ class VesselKeeperApp(Gtk.Window):
 
         return vbox
 
-    def _status_cell_data_func(self, column, cell, model, tree_iter, data):
-        status_text = model[tree_iter][9] # Assuming status is in column 9 for maintenance, 4 for dashboard
+    def _status_cell_data_func_main(self, column, cell, model, tree_iter, data):
+        # For the main maintenance list, Status is at index 8 (0-based)
+        status_text = model[tree_iter][8] # Corrected index for main list
+        if status_text == "Overdue":
+            cell.set_property('foreground', 'red')
+        elif status_text == "Due Soon":
+            cell.set_property('foreground', 'orange')
+        elif status_text == "On Schedule":
+            cell.set_property('foreground', 'green')
+        elif status_text == "Completed":
+            cell.set_property('foreground', 'gray')
+        else:
+            cell.set_property('foreground', 'black')
+
+    def _status_cell_data_func_dashboard(self, column, cell, model, tree_iter, data):
+        # For the dashboard list, Status is at index 4 (0-based)
+        status_text = model[tree_iter][4] # Corrected index for dashboard list
         if status_text == "Overdue":
             cell.set_property('foreground', 'red')
         elif status_text == "Due Soon":
@@ -3113,4 +3161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
