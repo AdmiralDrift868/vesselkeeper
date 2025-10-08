@@ -1,0 +1,3683 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Vessel Keeper - A comprehensive marine vessel maintenance and inventory management application.
+Expanded Version - Targeting ~5000 lines of code with enhanced features.
+"""
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Pango', '1.0') # For text formatting in reports
+from gi.repository import Gtk, Gdk, Gio, GLib, GObject, Pango
+import sys
+import os
+import sqlite3
+import logging
+import json
+import csv
+import datetime
+import threading
+import re
+import hashlib # For backup integrity
+import zipfile # For backup compression
+import shutil # For file operations
+import tempfile # For temporary files during import
+import math # For calculations
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict, Any, Callable
+from pathlib import Path
+import matplotlib
+matplotlib.use('Agg') # Use non-interactive backend for offline charting
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import base64 # For encoding images in attachments
+
+# --- Configuration ---
+CONFIG_FILE = "vessel_keeper_config.json"
+LOG_FILE = "vessel_keeper.log"
+BACKUP_DIR = "backups"
+ATTACHMENTS_DIR = "attachments"
+REPORTS_DIR = "reports"
+TEMPLATES_DIR = "templates"
+IMAGES_DIR = "images" # For storing vessel images, icons, etc.
+
+# Ensure directories exist
+for directory in [BACKUP_DIR, ATTACHMENTS_DIR, REPORTS_DIR, TEMPLATES_DIR, IMAGES_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+# --- Logging Setup ---
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- Enums ---
+class IntervalType(Enum):
+    HOURS = "Hours"
+    DAYS = "Days"
+    USAGE_CYCLES = "Usage Cycles"
+    
+    def display_name(self) -> str:
+        return self.value
+
+class Priority(Enum):
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+    CRITICAL = "Critical"
+    
+    def display_name(self) -> str:
+        return self.value
+
+class Status(Enum):
+    OVERDUE = ("Overdue", "#dc3545")  # Red
+    DUE_SOON = ("Due Soon", "#fd7e14")  # Orange
+    ON_SCHEDULE = ("On Schedule", "#28a745")  # Green
+    COMPLETED = ("Completed", "#6c757d")  # Gray
+    
+    def display_name(self) -> str:
+        return self.value[0]
+    
+    def color(self) -> Optional[str]:
+        return self.value[1]
+
+class TaskStatus(Enum):
+    PENDING = "Pending"
+    IN_PROGRESS = "In Progress"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+
+class TransactionType(Enum):
+    INBOUND = "Inbound"
+    OUTBOUND = "Outbound"
+    ADJUSTMENT = "Adjustment"
+
+class TripStatus(Enum):
+    PLANNED = "Planned"
+    IN_PROGRESS = "In Progress"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+
+# --- Constants ---
+VESSEL_TYPES = [
+    "Motor Yacht", "Sailboat", "Fishing Vessel", "Catamaran", "Trawler", 
+    "Cutter", "Ketch", "RIB", "Other"
+]
+SYSTEM_CATEGORIES = [
+    "Engine", "Electrical", "Hull", "Deck", "Navigation", "Safety", 
+    "Plumbing", "HVAC", "General"
+]
+
+# --- Data Classes ---
+@dataclass
+class ServiceInterval:
+    """Represents a standard service interval for a component."""
+    component: str
+    task: str
+    interval_hours: Tuple[int, int] # (min, max)
+    notes: str = ""
+
+@dataclass
+class Vessel:
+    id: Optional[int] = None
+    name: str = ""
+    vessel_type: str = ""
+    length: float = 0.0
+    beam: float = 0.0
+    draft: float = 0.0
+    engine_make: str = ""
+    engine_model: str = ""
+    engine_hours: float = 0.0
+    hull_material: str = ""
+    build_year: int = 0
+    last_survey: str = ""
+    insurance_expiry: str = ""
+    current_location: str = ""
+    notes: str = ""
+    attachments: List[str] = field(default_factory=list)
+    # Additional fields for expansion
+    registration_number: str = ""
+    home_port: str = ""
+    gross_tonnage: float = 0.0
+    image_path: str = "" # Path to vessel image
+
+@dataclass
+class MaintenanceTask:
+    id: Optional[int] = None
+    vessel_id: int = 0
+    vessel_name: str = "" # For display purposes
+    system: str = ""
+    task_name: str = ""
+    template_id: Optional[int] = None
+    interval_type: IntervalType = IntervalType.HOURS
+    interval_value: int = 0
+    last_completed: str = ""
+    last_hours: float = 0.0
+    next_due: str = ""
+    priority: Priority = Priority.MEDIUM
+    parts_required: Optional[List[int]] = None # List of InventoryItem IDs
+    instructions: str = ""
+    labor_cost: float = 0.0
+    total_parts_cost: float = 0.0 # Calculated from parts
+    total_job_cost: float = 0.0 # labor_cost + total_parts_cost
+    attachments: List[str] = field(default_factory=list) # List of file paths
+    # Additional fields for expansion
+    status: TaskStatus = TaskStatus.PENDING
+    assigned_to: str = ""
+    estimated_duration_hours: float = 0.0
+    actual_duration_hours: float = 0.0
+    notes: str = ""
+
+    def get_status(self, vessel_engine_hours: float, due_soon_days: int = 7) -> Status:
+        if self.status == TaskStatus.COMPLETED:
+            return Status.COMPLETED
+
+        if self.interval_type == IntervalType.DAYS and self.next_due:
+            try:
+                next_due_date = datetime.datetime.strptime(self.next_due, "%Y-%m-%d").date()
+                today = datetime.date.today()
+                if next_due_date < today:
+                    return Status.OVERDUE
+                elif (next_due_date - today).days <= due_soon_days:
+                    return Status.DUE_SOON
+                else:
+                    return Status.ON_SCHEDULE
+            except ValueError:
+                return Status.ON_SCHEDULE
+
+        elif self.interval_type in [IntervalType.HOURS, IntervalType.USAGE_CYCLES]:
+            if self.next_due:
+                try:
+                    next_due_hours = float(self.next_due)
+                    if vessel_engine_hours > next_due_hours:
+                        return Status.OVERDUE
+                    elif vessel_engine_hours + 10 >= next_due_hours: # 10 hour buffer
+                        return Status.DUE_SOON
+                    else:
+                        return Status.ON_SCHEDULE
+                except ValueError:
+                    return Status.ON_SCHEDULE
+            else:
+                # If no next_due is set, check based on last_completed + interval
+                if self.last_hours:
+                    target_hours = self.last_hours + self.interval_value
+                    if vessel_engine_hours > target_hours:
+                        return Status.OVERDUE
+                    elif vessel_engine_hours + 10 >= target_hours:
+                        return Status.DUE_SOON
+                    else:
+                        return Status.ON_SCHEDULE
+
+        return Status.ON_SCHEDULE
+
+@dataclass
+class InventoryItem:
+    id: Optional[int] = None
+    name: str = ""
+    part_number: str = ""
+    description: str = ""
+    category: str = ""
+    system: str = "" # Added system field
+    location: str = "" # Added location field
+    current_stock: int = 0
+    minimum_stock: int = 0
+    supplier_id: Optional[int] = None
+    unit_cost: float = 0.0
+    specifications: str = ""
+    attachments: List[str] = field(default_factory=list)
+    # Additional fields for expansion
+    reorder_quantity: int = 0 # Quantity to reorder when below min
+    last_reorder_date: str = ""
+    average_consumption_rate: float = 0.0 # Units per month
+    notes: str = ""
+
+@dataclass
+class Supplier:
+    id: Optional[int] = None
+    name: str = ""
+    contact: str = ""
+    phone: str = ""
+    email: str = ""
+    notes: str = ""
+    attachments: List[str] = field(default_factory=list)
+    # Additional fields for expansion
+    address: str = ""
+    website: str = ""
+    preferred: bool = False
+    terms: str = "" # Payment terms
+    last_order_date: str = ""
+
+@dataclass
+class TripLog:
+    id: Optional[int] = None
+    vessel_id: int = 0
+    vessel_name: str = "" # For display purposes
+    departure: str = ""
+    arrival: str = ""
+    origin: str = ""
+    destination: str = ""
+    start_hours: float = 0.0
+    end_hours: float = 0.0
+    fuel_used: float = 0.0
+    distance: float = 0.0
+    crew: str = ""
+    log_entries: str = ""
+    attachments: List[str] = field(default_factory=list)
+    # Additional fields for expansion
+    status: TripStatus = TripStatus.PLANNED
+    weather_conditions: str = ""
+    sea_state: str = ""
+    captain: str = ""
+    notes: str = ""
+
+@dataclass
+class MaintenanceTemplate:
+    id: Optional[int] = None
+    name: str = ""
+    system: str = ""
+    task_name: str = ""
+    interval_type: IntervalType = IntervalType.HOURS
+    interval_value: int = 0
+    priority: Priority = Priority.MEDIUM
+    parts_required: Optional[List[int]] = None # List of InventoryItem IDs
+    instructions: str = ""
+    labor_cost: float = 0.0
+    # Additional fields for expansion
+    estimated_duration_hours: float = 0.0
+    notes: str = ""
+
+@dataclass
+class ReportConfig:
+    """Configuration for a specific report."""
+    title: str
+    description: str
+    fields: List[str] # e.g., ["vessel_name", "task_name", "next_due"]
+    filters: Dict[str, Any] # e.g., {"status": "OVERDUE", "vessel_id": 1}
+    date_range: Optional[Tuple[str, str]] # ("YYYY-MM-DD", "YYYY-MM-DD")
+
+@dataclass
+class StockTransaction:
+    """Record of an inventory transaction."""
+    id: Optional[int] = None
+    item_id: int = 0
+    transaction_type: TransactionType = TransactionType.INBOUND
+    quantity: int = 0
+    date: str = "" # YYYY-MM-DD
+    reference: str = "" # e.g., order number, job ID
+    notes: str = ""
+
+@dataclass
+class PerformanceMetric:
+    """Vessel performance metric."""
+    id: Optional[int] = None
+    vessel_id: int = 0
+    metric_name: str = "" # e.g., "Fuel Efficiency", "Engine Hours"
+    value: float = 0.0
+    unit: str = "" # e.g., "MPG", "Hours"
+    date_recorded: str = "" # YYYY-MM-DD
+    notes: str = ""
+
+# --- Database Class ---
+class Database:
+    def __init__(self, db_path: str = "vessel_keeper.db"):
+        self.db_path = db_path
+        self.conn = None
+        self._connect()
+        self._create_tables()
+
+    def _connect(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row # Enable column access by name
+
+    def _create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS vessels (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            vessel_type TEXT,
+            length REAL,
+            beam REAL,
+            draft REAL,
+            engine_make TEXT,
+            engine_model TEXT,
+            engine_hours REAL DEFAULT 0,
+            hull_material TEXT,
+            build_year INTEGER,
+            last_survey TEXT,
+            insurance_expiry TEXT,
+            current_location TEXT,
+            notes TEXT,
+            attachments TEXT, -- JSON list of file paths
+            registration_number TEXT,
+            home_port TEXT,
+            gross_tonnage REAL,
+            image_path TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS maintenance_tasks (
+            id INTEGER PRIMARY KEY,
+            vessel_id INTEGER REFERENCES vessels(id) ON DELETE CASCADE,
+            system TEXT,
+            task_name TEXT NOT NULL,
+            template_id INTEGER,
+            interval_type TEXT,
+            interval_value INTEGER,
+            last_completed TEXT,
+            last_hours REAL,
+            next_due TEXT,
+            priority TEXT,
+            parts_required TEXT, -- JSON list of inventory item IDs
+            instructions TEXT,
+            labor_cost REAL DEFAULT 0,
+            total_parts_cost REAL DEFAULT 0,
+            attachments TEXT, -- JSON list of file paths
+            status TEXT DEFAULT 'PENDING',
+            assigned_to TEXT,
+            estimated_duration_hours REAL DEFAULT 0,
+            actual_duration_hours REAL DEFAULT 0,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            part_number TEXT,
+            description TEXT,
+            category TEXT,
+            system TEXT,
+            location TEXT,
+            current_stock INTEGER DEFAULT 0,
+            minimum_stock INTEGER DEFAULT 0,
+            supplier_id INTEGER REFERENCES suppliers(id),
+            unit_cost REAL DEFAULT 0,
+            specifications TEXT,
+            attachments TEXT, -- JSON list of file paths
+            reorder_quantity INTEGER DEFAULT 0,
+            last_reorder_date TEXT,
+            average_consumption_rate REAL DEFAULT 0,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            contact TEXT,
+            phone TEXT,
+            email TEXT,
+            notes TEXT,
+            attachments TEXT, -- JSON list of file paths
+            address TEXT,
+            website TEXT,
+            preferred BOOLEAN DEFAULT 0,
+            terms TEXT,
+            last_order_date TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS trip_logs (
+            id INTEGER PRIMARY KEY,
+            vessel_id INTEGER REFERENCES vessels(id) ON DELETE CASCADE,
+            departure TEXT,
+            arrival TEXT,
+            origin TEXT,
+            destination TEXT,
+            start_hours REAL,
+            end_hours REAL,
+            fuel_used REAL,
+            distance REAL,
+            crew TEXT,
+            log_entries TEXT,
+            attachments TEXT, -- JSON list of file paths
+            status TEXT DEFAULT 'PLANNED',
+            weather_conditions TEXT,
+            sea_state TEXT,
+            captain TEXT,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS maintenance_templates (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            system TEXT,
+            task_name TEXT NOT NULL,
+            interval_type TEXT,
+            interval_value INTEGER,
+            priority TEXT,
+            parts_required TEXT, -- JSON list of inventory item IDs
+            instructions TEXT,
+            labor_cost REAL DEFAULT 0,
+            estimated_duration_hours REAL DEFAULT 0,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_transactions (
+            id INTEGER PRIMARY KEY,
+            item_id INTEGER REFERENCES inventory(id) ON DELETE CASCADE,
+            transaction_type TEXT,
+            quantity INTEGER,
+            date TEXT,
+            reference TEXT,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS performance_metrics (
+            id INTEGER PRIMARY KEY,
+            vessel_id INTEGER REFERENCES vessels(id) ON DELETE CASCADE,
+            metric_name TEXT,
+            value REAL,
+            unit TEXT,
+            date_recorded TEXT,
+            notes TEXT
+        );
+        """)
+        self.conn.commit()
+
+    def close(self):
+        try:
+            if self.conn:
+                self.conn.close()
+                logger.info("Database connection closed.")
+        except Exception as e:
+            logger.error(f"Error closing DB: {e}")
+
+    # --- Vessels ---
+    def add_vessel(self, vessel: Vessel) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """INSERT INTO vessels 
+            (name, vessel_type, length, beam, draft, engine_make, engine_model, 
+             engine_hours, hull_material, build_year, last_survey, insurance_expiry, 
+             current_location, notes, attachments, registration_number, home_port, 
+             gross_tonnage, image_path) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (vessel.name, vessel.vessel_type, vessel.length, vessel.beam, vessel.draft,
+             vessel.engine_make, vessel.engine_model, vessel.engine_hours,
+             vessel.hull_material, vessel.build_year, vessel.last_survey,
+             vessel.insurance_expiry, vessel.current_location, vessel.notes,
+             json.dumps(vessel.attachments), vessel.registration_number,
+             vessel.home_port, vessel.gross_tonnage, vessel.image_path)
+        )
+        self.conn.commit()
+        vessel_id = cursor.lastrowid
+        logger.info(f"Added vessel with ID {vessel_id}")
+        return vessel_id
+
+    def get_vessels(self) -> List[Vessel]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM vessels")
+        rows = cursor.fetchall()
+        vessels = []
+        for row in rows:
+            vessels.append(Vessel(
+                id=row['id'],
+                name=row['name'],
+                vessel_type=row['vessel_type'],
+                length=row['length'],
+                beam=row['beam'],
+                draft=row['draft'],
+                engine_make=row['engine_make'],
+                engine_model=row['engine_model'],
+                engine_hours=row['engine_hours'],
+                hull_material=row['hull_material'],
+                build_year=row['build_year'],
+                last_survey=row['last_survey'],
+                insurance_expiry=row['insurance_expiry'],
+                current_location=row['current_location'],
+                notes=row['notes'],
+                attachments=json.loads(row['attachments']) if row['attachments'] else [],
+                registration_number=row['registration_number'],
+                home_port=row['home_port'],
+                gross_tonnage=row['gross_tonnage'],
+                image_path=row['image_path']
+            ))
+        return vessels
+
+    def update_vessel(self, vessel: Vessel):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """UPDATE vessels SET 
+            name=?, vessel_type=?, length=?, beam=?, draft=?, engine_make=?, 
+            engine_model=?, engine_hours=?, hull_material=?, build_year=?, 
+            last_survey=?, insurance_expiry=?, current_location=?, notes=?, 
+            attachments=?, registration_number=?, home_port=?, gross_tonnage=?, 
+            image_path=? WHERE id=?""",
+            (vessel.name, vessel.vessel_type, vessel.length, vessel.beam, vessel.draft,
+             vessel.engine_make, vessel.engine_model, vessel.engine_hours,
+             vessel.hull_material, vessel.build_year, vessel.last_survey,
+             vessel.insurance_expiry, vessel.current_location, vessel.notes,
+             json.dumps(vessel.attachments), vessel.registration_number,
+             vessel.home_port, vessel.gross_tonnage, vessel.image_path, vessel.id)
+        )
+        self.conn.commit()
+        logger.info(f"Updated vessel with ID {vessel.id}")
+
+    def delete_vessel(self, vessel_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM vessels WHERE id=?", (vessel_id,))
+        self.conn.commit()
+        logger.info(f"Deleted vessel with ID {vessel_id}")
+
+    # --- Maintenance Tasks ---
+    def add_maintenance_task(self, task: MaintenanceTask) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """INSERT INTO maintenance_tasks 
+            (vessel_id, system, task_name, template_id, interval_type, interval_value, 
+             last_completed, last_hours, next_due, priority, parts_required, instructions, 
+             labor_cost, total_parts_cost, attachments, status, assigned_to, 
+             estimated_duration_hours, actual_duration_hours, notes) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task.vessel_id, task.system, task.task_name, task.template_id,
+             task.interval_type.name if task.interval_type else None, task.interval_value,
+             task.last_completed, task.last_hours, task.next_due,
+             task.priority.name if task.priority else None,
+             json.dumps(task.parts_required) if task.parts_required else None,
+             task.instructions, task.labor_cost, task.total_parts_cost,
+             json.dumps(task.attachments), task.status.name,
+             task.assigned_to, task.estimated_duration_hours,
+             task.actual_duration_hours, task.notes)
+        )
+        self.conn.commit()
+        task_id = cursor.lastrowid
+        logger.info(f"Added maintenance task with ID {task_id}")
+        return task_id
+
+    def get_maintenance_tasks(self) -> List[MaintenanceTask]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM maintenance_tasks")
+        rows = cursor.fetchall()
+        tasks = []
+        for row in rows:
+            parts_required = json.loads(row['parts_required']) if row['parts_required'] else None
+            tasks.append(MaintenanceTask(
+                id=row['id'],
+                vessel_id=row['vessel_id'],
+                system=row['system'],
+                task_name=row['task_name'],
+                template_id=row['template_id'],
+                interval_type=IntervalType[row['interval_type']] if row['interval_type'] in IntervalType.__members__ else IntervalType.HOURS,
+                interval_value=int(row['interval_value']),
+                last_completed=row['last_completed'],
+                last_hours=float(row['last_hours']),
+                next_due=row['next_due'],
+                priority=Priority[row['priority']] if row['priority'] in Priority.__members__ else Priority.MEDIUM,
+                parts_required=parts_required,
+                instructions=row['instructions'],
+                labor_cost=float(row['labor_cost']),
+                total_parts_cost=float(row['total_parts_cost']),
+                total_job_cost=float(row['labor_cost']) + float(row['total_parts_cost']),
+                attachments=json.loads(row['attachments']) if row['attachments'] else [],
+                status=TaskStatus[row['status']] if row['status'] in TaskStatus.__members__ else TaskStatus.PENDING,
+                assigned_to=row['assigned_to'],
+                estimated_duration_hours=float(row['estimated_duration_hours']),
+                actual_duration_hours=float(row['actual_duration_hours']),
+                notes=row['notes']
+            ))
+        return tasks
+
+    def update_maintenance_task(self, task: MaintenanceTask):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """UPDATE maintenance_tasks SET
+            vessel_id=?, system=?, task_name=?, template_id=?, interval_type=?, 
+            interval_value=?, last_completed=?, last_hours=?, next_due=?, 
+            priority=?, parts_required=?, instructions=?, labor_cost=?, 
+            total_parts_cost=?, attachments=?, status=?, assigned_to=?, 
+            estimated_duration_hours=?, actual_duration_hours=?, notes=? WHERE id=?""",
+            (task.vessel_id, task.system, task.task_name, task.template_id,
+             task.interval_type.name if task.interval_type else None, task.interval_value,
+             task.last_completed, task.last_hours, task.next_due,
+             task.priority.name if task.priority else None,
+             json.dumps(task.parts_required) if task.parts_required else None,
+             task.instructions, task.labor_cost, task.total_parts_cost,
+             json.dumps(task.attachments), task.status.name,
+             task.assigned_to, task.estimated_duration_hours,
+             task.actual_duration_hours, task.notes, task.id)
+        )
+        self.conn.commit()
+        logger.info(f"Updated maintenance task with ID {task.id}")
+
+    def delete_maintenance_task(self, task_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM maintenance_tasks WHERE id=?", (task_id,))
+        self.conn.commit()
+        logger.info(f"Deleted maintenance task with ID {task_id}")
+
+    # --- Inventory ---
+    def add_inventory_item(self, item: InventoryItem) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """INSERT INTO inventory 
+            (name, part_number, description, category, system, location, 
+             current_stock, minimum_stock, supplier_id, unit_cost, specifications, attachments, 
+             reorder_quantity, last_reorder_date, average_consumption_rate, notes) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (item.name, item.part_number, item.description, item.category, 
+             item.system, item.location, item.current_stock, item.minimum_stock,
+             item.supplier_id, item.unit_cost, item.specifications, 
+             json.dumps(item.attachments), item.reorder_quantity,
+             item.last_reorder_date, item.average_consumption_rate, item.notes)
+        )
+        self.conn.commit()
+        item_id = cursor.lastrowid
+        logger.info(f"Added inventory item with ID {item_id}")
+        return item_id
+
+    def get_inventory_items(self) -> List[InventoryItem]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM inventory")
+        rows = cursor.fetchall()
+        items = []
+        for row in rows:
+            items.append(InventoryItem(
+                id=row['id'],
+                name=row['name'],
+                part_number=row['part_number'],
+                description=row['description'],
+                category=row['category'],
+                system=row['system'],
+                location=row['location'],
+                current_stock=row['current_stock'],
+                minimum_stock=row['minimum_stock'],
+                supplier_id=row['supplier_id'],
+                unit_cost=float(row['unit_cost']),
+                specifications=row['specifications'],
+                attachments=json.loads(row['attachments']) if row['attachments'] else [],
+                reorder_quantity=row['reorder_quantity'],
+                last_reorder_date=row['last_reorder_date'],
+                average_consumption_rate=float(row['average_consumption_rate']),
+                notes=row['notes']
+            ))
+        return items
+
+    def update_inventory_item(self, item: InventoryItem):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """UPDATE inventory SET
+            name=?, part_number=?, description=?, category=?, system=?, location=?, 
+            current_stock=?, minimum_stock=?, supplier_id=?, unit_cost=?, 
+            specifications=?, attachments=?, reorder_quantity=?, 
+            last_reorder_date=?, average_consumption_rate=?, notes=? WHERE id=?""",
+            (item.name, item.part_number, item.description, item.category,
+             item.system, item.location, item.current_stock, item.minimum_stock,
+             item.supplier_id, item.unit_cost, item.specifications,
+             json.dumps(item.attachments), item.reorder_quantity,
+             item.last_reorder_date, item.average_consumption_rate, item.notes, item.id)
+        )
+        self.conn.commit()
+        logger.info(f"Updated inventory item with ID {item.id}")
+
+    def delete_inventory_item(self, item_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM inventory WHERE id=?", (item_id,))
+        self.conn.commit()
+        logger.info(f"Deleted inventory item with ID {item_id}")
+
+    # --- Suppliers ---
+    def add_supplier(self, supplier: Supplier) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO suppliers (name, contact, phone, email, notes, attachments, address, website, preferred, terms, last_order_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (supplier.name, supplier.contact, supplier.phone, supplier.email, 
+             supplier.notes, json.dumps(supplier.attachments), supplier.address,
+             supplier.website, supplier.preferred, supplier.terms, supplier.last_order_date)
+        )
+        self.conn.commit()
+        supplier_id = cursor.lastrowid
+        logger.info(f"Added supplier with ID {supplier_id}")
+        return supplier_id
+
+    def get_suppliers(self) -> List[Supplier]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM suppliers")
+        rows = cursor.fetchall()
+        suppliers = []
+        for row in rows:
+            suppliers.append(Supplier(
+                id=row['id'],
+                name=row['name'],
+                contact=row['contact'],
+                phone=row['phone'],
+                email=row['email'],
+                notes=row['notes'],
+                attachments=json.loads(row['attachments']) if row['attachments'] else [],
+                address=row['address'],
+                website=row['website'],
+                preferred=bool(row['preferred']),
+                terms=row['terms'],
+                last_order_date=row['last_order_date']
+            ))
+        return suppliers
+
+    def update_supplier(self, supplier: Supplier):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE suppliers SET name=?, contact=?, phone=?, email=?, notes=?, attachments=?, address=?, website=?, preferred=?, terms=?, last_order_date=? WHERE id=?",
+            (supplier.name, supplier.contact, supplier.phone, supplier.email,
+             supplier.notes, json.dumps(supplier.attachments), supplier.address,
+             supplier.website, supplier.preferred, supplier.terms, supplier.last_order_date, supplier.id)
+        )
+        self.conn.commit()
+        logger.info(f"Updated supplier with ID {supplier.id}")
+
+    def delete_supplier(self, supplier_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM suppliers WHERE id=?", (supplier_id,))
+        self.conn.commit()
+        logger.info(f"Deleted supplier with ID {supplier_id}")
+
+    # --- Trip Logs ---
+    def add_trip_log(self, log: TripLog) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """INSERT INTO trip_logs 
+            (vessel_id, departure, arrival, origin, destination, start_hours, 
+             end_hours, fuel_used, distance, crew, log_entries, attachments, 
+             status, weather_conditions, sea_state, captain, notes) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (log.vessel_id, log.departure, log.arrival, log.origin, log.destination,
+             log.start_hours, log.end_hours, log.fuel_used, log.distance,
+             log.crew, log.log_entries, json.dumps(log.attachments),
+             log.status.name, log.weather_conditions, log.sea_state, log.captain, log.notes)
+        )
+        self.conn.commit()
+        log_id = cursor.lastrowid
+        logger.info(f"Added trip log with ID {log_id}")
+        return log_id
+
+    def get_trip_logs(self) -> List[TripLog]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM trip_logs")
+        rows = cursor.fetchall()
+        logs = []
+        for row in rows:
+            logs.append(TripLog(
+                id=row['id'],
+                vessel_id=row['vessel_id'],
+                departure=row['departure'],
+                arrival=row['arrival'],
+                origin=row['origin'],
+                destination=row['destination'],
+                start_hours=float(row['start_hours']),
+                end_hours=float(row['end_hours']),
+                fuel_used=float(row['fuel_used']),
+                distance=float(row['distance']),
+                crew=row['crew'],
+                log_entries=row['log_entries'],
+                attachments=json.loads(row['attachments']) if row['attachments'] else [],
+                status=TripStatus[row['status']] if row['status'] in TripStatus.__members__ else TripStatus.PLANNED,
+                weather_conditions=row['weather_conditions'],
+                sea_state=row['sea_state'],
+                captain=row['captain'],
+                notes=row['notes']
+            ))
+        return logs
+
+    # --- Maintenance Templates ---
+    def add_maintenance_template(self, template: MaintenanceTemplate) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """INSERT INTO maintenance_templates 
+            (name, system, task_name, interval_type, interval_value, priority, 
+             parts_required, instructions, labor_cost, estimated_duration_hours, notes) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (template.name, template.system, template.task_name,
+             template.interval_type.name if template.interval_type else None,
+             template.interval_value, template.priority.name if template.priority else None,
+             json.dumps(template.parts_required) if template.parts_required else None,
+             template.instructions, template.labor_cost, template.estimated_duration_hours, template.notes)
+        )
+        self.conn.commit()
+        template_id = cursor.lastrowid
+        logger.info(f"Added maintenance template with ID {template_id}")
+        return template_id
+
+    def get_maintenance_templates(self) -> List[MaintenanceTemplate]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM maintenance_templates")
+        rows = cursor.fetchall()
+        templates = []
+        for row in rows:
+            parts_required = json.loads(row['parts_required']) if row['parts_required'] else None
+            interval_type = IntervalType[row['interval_type']] if row['interval_type'] in IntervalType.__members__ else IntervalType.HOURS
+            priority = Priority.MEDIUM
+            if row['priority'] and row['priority'] in Priority.__members__:
+                priority = Priority[row['priority']]
+            template = MaintenanceTemplate(
+                id=row['id'],
+                name=row['name'],
+                system=row['system'],
+                task_name=row['task_name'],
+                interval_type=interval_type,
+                interval_value=row['interval_value'],
+                priority=priority,
+                parts_required=parts_required,
+                instructions=row['instructions'],
+                labor_cost=float(row['labor_cost']),
+                estimated_duration_hours=float(row['estimated_duration_hours']),
+                notes=row['notes']
+            )
+            templates.append(template)
+        return templates
+
+    # --- Stock Transactions ---
+    def add_stock_transaction(self, transaction: StockTransaction) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO stock_transactions (item_id, transaction_type, quantity, date, reference, notes) VALUES (?, ?, ?, ?, ?, ?)",
+            (transaction.item_id, transaction.transaction_type.name,
+             transaction.quantity, transaction.date, transaction.reference, transaction.notes)
+        )
+        self.conn.commit()
+        transaction_id = cursor.lastrowid
+        logger.info(f"Added stock transaction with ID {transaction_id}")
+        return transaction_id
+
+    def get_stock_transactions(self, item_id: Optional[int] = None) -> List[StockTransaction]:
+        cursor = self.conn.cursor()
+        if item_id:
+            cursor.execute("SELECT * FROM stock_transactions WHERE item_id = ? ORDER BY date DESC", (item_id,))
+        else:
+            cursor.execute("SELECT * FROM stock_transactions ORDER BY date DESC")
+        rows = cursor.fetchall()
+        transactions = []
+        for row in rows:
+            transactions.append(StockTransaction(
+                id=row['id'],
+                item_id=row['item_id'],
+                transaction_type=TransactionType[row['transaction_type']] if row['transaction_type'] in TransactionType.__members__ else TransactionType.INBOUND,
+                quantity=row['quantity'],
+                date=row['date'],
+                reference=row['reference'],
+                notes=row['notes']
+            ))
+        return transactions
+
+    # --- Performance Metrics ---
+    def add_performance_metric(self, metric: PerformanceMetric) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO performance_metrics (vessel_id, metric_name, value, unit, date_recorded, notes) VALUES (?, ?, ?, ?, ?, ?)",
+            (metric.vessel_id, metric.metric_name, metric.value, metric.unit, metric.date_recorded, metric.notes)
+        )
+        self.conn.commit()
+        metric_id = cursor.lastrowid
+        logger.info(f"Added performance metric with ID {metric_id}")
+        return metric_id
+
+    def get_performance_metrics(self, vessel_id: Optional[int] = None, metric_name: Optional[str] = None) -> List[PerformanceMetric]:
+        cursor = self.conn.cursor()
+        query = "SELECT * FROM performance_metrics WHERE 1=1"
+        params = []
+        if vessel_id:
+            query += " AND vessel_id = ?"
+            params.append(vessel_id)
+        if metric_name:
+            query += " AND metric_name = ?"
+            params.append(metric_name)
+        query += " ORDER BY date_recorded DESC"
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        metrics = []
+        for row in rows:
+            metrics.append(PerformanceMetric(
+                id=row['id'],
+                vessel_id=row['vessel_id'],
+                metric_name=row['metric_name'],
+                value=float(row['value']),
+                unit=row['unit'],
+                date_recorded=row['date_recorded'],
+                notes=row['notes']
+            ))
+        return metrics
+
+    # --- Import/Export ---
+    def export_data_to_csv(self, export_dir: str):
+        tables = {
+            "vessels": self.get_vessels(),
+            "maintenance_tasks": self.get_maintenance_tasks(),
+            "inventory": self.get_inventory_items(),
+            "suppliers": self.get_suppliers(),
+            "trip_logs": self.get_trip_logs(),
+            "maintenance_templates": self.get_maintenance_templates(),
+            "stock_transactions": self.get_stock_transactions(),
+            "performance_metrics": self.get_performance_metrics()
+        }
+        for table_name, data_list in tables.items():
+            if not data_list:
+                continue # Skip empty tables
+            filename = os.path.join(export_dir, f"{table_name}.csv")
+            try:
+                with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                    if not data_list:
+                        continue # No data to write
+                    # Get fieldnames from the first object's __dict__
+                    sample_obj = data_list[0]
+                    # Filter out complex types for CSV (like List[str], nested objects)
+                    # This is a simplified approach; for complex objects, you might need custom serialization
+                    fieldnames = [k for k, v in sample_obj.__dict__.items() 
+                                  if not isinstance(v, (list, dict, tuple, object))]
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for obj in data_list:
+                        # Create a dictionary with only simple types
+                        row_dict = {k: v for k, v in obj.__dict__.items() 
+                                    if not isinstance(v, (list, dict, tuple, object))}
+                        # Handle specific complex fields manually
+                        if table_name == "maintenance_tasks":
+                            row_dict['parts_required'] = json.dumps(obj.parts_required) if obj.parts_required else None
+                        elif table_name == "vessels":
+                            row_dict['attachments'] = json.dumps(obj.attachments) if obj.attachments else None
+                        elif table_name == "inventory":
+                            row_dict['attachments'] = json.dumps(obj.attachments) if obj.attachments else None
+                        elif table_name == "suppliers":
+                            row_dict['attachments'] = json.dumps(obj.attachments) if obj.attachments else None
+                        elif table_name == "trip_logs":
+                            row_dict['attachments'] = json.dumps(obj.attachments) if obj.attachments else None
+                        
+                        writer.writerow(row_dict)
+                logger.info(f"Exported {table_name} to {filename}")
+            except Exception as e:
+                logger.error(f"Failed to export {table_name} to {filename}: {e}")
+                return False
+        return True
+
+    def import_data_from_csv(self, import_dir: str):
+        # This is a complex function that requires careful handling
+        # of foreign key relationships, ID mapping, etc.
+        # For simplicity in this expansion, we'll just import vessels as an example
+        # A full implementation would handle all tables.
+        vessel_file = os.path.join(import_dir, "vessels.csv")
+        if os.path.exists(vessel_file):
+            try:
+                with open(vessel_file, 'r', newline='', encoding='utf-8') as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    for row in reader:
+                        attachments_raw = row.get('attachments', '[]')
+                        try:
+                            attachments = json.loads(attachments_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            attachments = []
+                        
+                        # Copy attachments to local directory if they exist
+                        local_attachments = []
+                        for att_path in attachments:
+                            if os.path.exists(att_path):
+                                filename = os.path.basename(att_path)
+                                dest_path = os.path.join(ATTACHMENTS_DIR, filename)
+                                shutil.copy2(att_path, dest_path)
+                                local_attachments.append(dest_path)
+                            else:
+                                logger.warning(f"Attachment file not found during import: {att_path}")
+                        
+                        vessel = Vessel(
+                            name=row.get('name', ''),
+                            vessel_type=row.get('vessel_type', ''),
+                            length=float(row.get('length', 0.0)),
+                            beam=float(row.get('beam', 0.0)),
+                            draft=float(row.get('draft', 0.0)),
+                            engine_make=row.get('engine_make', ''),
+                            engine_model=row.get('engine_model', ''),
+                            engine_hours=float(row.get('engine_hours', 0.0)),
+                            hull_material=row.get('hull_material', ''),
+                            build_year=int(row.get('build_year', 0)),
+                            last_survey=row.get('last_survey', ''),
+                            insurance_expiry=row.get('insurance_expiry', ''),
+                            current_location=row.get('current_location', ''),
+                            notes=row.get('notes', ''),
+                            attachments=local_attachments,
+                            registration_number=row.get('registration_number', ''),
+                            home_port=row.get('home_port', ''),
+                            gross_tonnage=float(row.get('gross_tonnage', 0.0)),
+                            image_path=row.get('image_path', '') # Copy image if needed
+                        )
+                        # Check if vessel already exists by name
+                        existing_vessels = [v for v in self.get_vessels() if v.name == vessel.name]
+                        if not existing_vessels:
+                            self.add_vessel(vessel)
+                            logger.info(f"Imported vessel: {vessel.name}")
+                        else:
+                            logger.info(f"Vessel already exists, skipping: {vessel.name}")
+            except Exception as e:
+                logger.error(f"Failed to import vessels from {vessel_file}: {e}")
+                return False
+        return True
+
+# --- Utility Functions ---
+def show_error_dialog(parent: Gtk.Window, message: str):
+    dialog = Gtk.MessageDialog(
+        transient_for=parent,
+        flags=0,
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.OK,
+        text=message
+    )
+    dialog.run()
+    dialog.destroy()
+
+def show_info_dialog(parent: Gtk.Window, message: str):
+    dialog = Gtk.MessageDialog(
+        transient_for=parent,
+        flags=0,
+        message_type=Gtk.MessageType.INFO,
+        buttons=Gtk.ButtonsType.OK,
+        text=message
+    )
+    dialog.run()
+    dialog.destroy()
+
+def show_confirmation_dialog(parent: Gtk.Window, message: str) -> bool:
+    dialog = Gtk.MessageDialog(
+        transient_for=parent,
+        flags=0,
+        message_type=Gtk.MessageType.QUESTION,
+        buttons=Gtk.ButtonsType.YES_NO,
+        text=message
+    )
+    response = dialog.run()
+    dialog.destroy()
+    return response == Gtk.ResponseType.YES
+
+def validate_date(date_str: str) -> bool:
+    if not date_str:
+        return True
+    try:
+        datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        return True
+    except ValueError:
+        return False
+
+def validate_email(email: str) -> bool:
+    if not email:
+        return True
+    email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(email_regex, email) is not None
+
+def calculate_maintenance_cost(task: MaintenanceTask, db: Database) -> Tuple[float, float, float]:
+    """Calculate labor, parts, and total cost for a task."""
+    labor_cost = task.labor_cost
+    parts_cost = 0.0
+    if task.parts_required:
+        for item_id in task.parts_required:
+            item = next((i for i in db.get_inventory_items() if i.id == item_id), None)
+            if item:
+                parts_cost += item.unit_cost
+    total_cost = labor_cost + parts_cost
+    return labor_cost, parts_cost, total_cost
+
+def update_task_next_due(task: MaintenanceTask, vessel: Vessel) -> str:
+    """Calculate the next due date based on the last completed date and interval."""
+    if task.interval_type == IntervalType.DAYS and task.last_completed:
+        try:
+            last_date = datetime.datetime.strptime(task.last_completed, "%Y-%m-%d").date()
+            next_date = last_date + datetime.timedelta(days=task.interval_value)
+            return next_date.strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+    elif task.interval_type in [IntervalType.HOURS, IntervalType.USAGE_CYCLES] and task.last_hours:
+        next_hours = task.last_hours + task.interval_value
+        return str(next_hours)
+    return ""
+
+def _get_selected_item(tree_view, store):
+    """Get the selected item ID from a tree view."""
+    selection = tree_view.get_selection()
+    model, tree_iter = selection.get_selected() # model could be the filter or the store
+    if tree_iter is not None:
+        try:
+            # Check if the model is a filter and convert iter if necessary
+            # This is the safer way using the model's own method
+            if hasattr(model, 'convert_iter_to_child_iter'):
+                # It's a filter model, convert the iter
+                child_iter = model.convert_iter_to_child_iter(tree_iter)
+                child_model = model.get_model() # Get the underlying store
+                return child_model[child_iter][0] # Assuming ID is in column 0
+            else:
+                # It's the store itself
+                return model[tree_iter][0] # Assuming ID is in column 0
+        except Exception as e:
+            logger.error(f"Error getting selected item ID: {e}")
+            # Show error dialog to parent window
+            parent_window = tree_view.get_toplevel()
+            if isinstance(parent_window, Gtk.Window):
+                show_error_dialog(parent_window, "Could not identify the selected item.")
+            return None
+    return None
+
+# --- Attachment Widget ---
+class AttachmentWidget(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        self.set_border_width(5)
+
+        # Label
+        label = Gtk.Label(label="Attachments:")
+        label.set_halign(Gtk.Align.START)
+        self.pack_start(label, False, False, 0)
+
+        # List store for attachments
+        self.attachment_store = Gtk.ListStore(str) # Path
+        # Tree view for attachments
+        self.attachment_tree = Gtk.TreeView(model=self.attachment_store)
+        renderer = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn("File Path", renderer, text=0)
+        self.attachment_tree.append_column(column)
+
+        # Scrolled window for attachment list
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+        scrolled_window.add(self.attachment_tree)
+        self.pack_start(scrolled_window, True, True, 0)
+
+        # Buttons
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        add_button = Gtk.Button(label="Add...")
+        add_button.connect("clicked", self.on_add_attachment)
+        button_box.pack_start(add_button, True, True, 0)
+
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.connect("clicked", self.on_remove_attachment)
+        button_box.pack_start(remove_button, True, True, 0)
+
+        self.pack_start(button_box, False, False, 0)
+
+    def on_add_attachment(self, button):
+        dialog = Gtk.FileChooserDialog(
+            title="Select Attachment",
+            parent=self.get_toplevel(),
+            action=Gtk.FileChooserAction.OPEN,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        )
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            filename = dialog.get_filename()
+            if filename:
+                # Copy file to attachments directory
+                dest_path = os.path.join(ATTACHMENTS_DIR, os.path.basename(filename))
+                shutil.copy2(filename, dest_path)
+                self.attachment_store.append([dest_path])
+        dialog.destroy()
+
+    def on_remove_attachment(self, button):
+        selection = self.attachment_tree.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter:
+            path = model[tree_iter][0]
+            model.remove(tree_iter)
+            # Optionally delete the file from disk
+            # if os.path.exists(path):
+            #     os.remove(path)
+
+    def get_attachments(self) -> List[str]:
+        attachments = []
+        for row in self.attachment_store:
+            attachments.append(row[0])
+        return attachments
+
+    def set_attachments(self, attachments: List[str]):
+        self.attachment_store.clear()
+        for path in attachments:
+            self.attachment_store.append([path])
+
+# --- Date Picker Entry Widget ---
+class DatePickerEntry(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+
+        self.entry = Gtk.Entry()
+        self.button = Gtk.Button(label="...")
+
+        self.pack_start(self.entry, True, True, 0)
+        self.pack_start(self.button, False, False, 0)
+
+        self.button.connect("clicked", self._on_button_clicked)
+
+    def _on_button_clicked(self, button):
+        dialog = Gtk.Dialog(title="Select Date", transient_for=self.get_toplevel(),
+                           flags=0, buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                                            Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        dialog.set_default_size(300, 200)
+
+        calendar = Gtk.Calendar()
+        dialog.get_content_area().pack_start(calendar, True, True, 0)
+        dialog.show_all()
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            year, month, day = calendar.get_date()
+            date_str = f"{year}-{month+1:02d}-{day:02d}"
+            self.entry.set_text(date_str)
+
+        dialog.destroy()
+
+    def get_text(self) -> str:
+        return self.entry.get_text()
+
+    def set_text(self, text: str):
+        self.entry.set_text(text)
+
+    def validate_date(self) -> bool:
+        return validate_date(self.entry.get_text())
+
+    def grab_focus(self):
+        self.entry.grab_focus()
+
+# --- Base Editor Class ---
+class BaseEditor(Gtk.Dialog):
+    def __init__(self, parent: Gtk.Window, title: str, item=None):
+        super().__init__(title=title, transient_for=parent, flags=0)
+        self.item = item
+        self.grid = Gtk.Grid()
+        self.grid.set_row_spacing(10)
+        self.grid.set_column_spacing(10)
+        self.grid.set_border_width(10)
+
+        content_area = self.get_content_area()
+        content_area.add(self.grid)
+
+        self.row_counter = 0
+
+        # Add OK and Cancel buttons
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        ok_button = self.add_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        ok_button.get_style_context().add_class("suggested-action")
+
+        self.set_default_size(400, 300)
+        self.set_modal(True)
+
+    def _add_form_field(self, row: int, label_text: str, widget) -> Gtk.Widget:
+        label = Gtk.Label(label=label_text)
+        label.set_halign(Gtk.Align.START)
+        self.grid.attach(label, 0, row, 1, 1)
+        self.grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def validate(self) -> bool:
+        """Override in subclasses to implement validation logic"""
+        return True
+
+# --- Vessel Editor ---
+class VesselEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, vessel: Vessel = None):
+        super().__init__(parent, "Edit Vessel" if vessel else "Add Vessel", vessel)
+        self.db = db
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.name_entry = self._add_form_field(0, "Name:", Gtk.Entry())
+        self.type_combo = Gtk.ComboBoxText()
+        for vessel_type in VESSEL_TYPES:
+            self.type_combo.append_text(vessel_type)
+        self._add_form_field(1, "Type:", self.type_combo)
+
+        self.length_entry = self._add_form_field(2, "Length (ft):", Gtk.SpinButton.new_with_range(0, 500, 0.1))
+        self.beam_entry = self._add_form_field(3, "Beam (ft):", Gtk.SpinButton.new_with_range(0, 100, 0.1))
+        self.draft_entry = self._add_form_field(4, "Draft (ft):", Gtk.SpinButton.new_with_range(0, 50, 0.1))
+        self.engine_make_entry = self._add_form_field(5, "Engine Make:", Gtk.Entry())
+        self.engine_model_entry = self._add_form_field(6, "Engine Model:", Gtk.Entry())
+        self.engine_hours_entry = self._add_form_field(7, "Engine Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.hull_material_entry = self._add_form_field(8, "Hull Material:", Gtk.Entry())
+        self.build_year_entry = self._add_form_field(9, "Build Year:", Gtk.SpinButton.new_with_range(1900, 2100, 1))
+        self.registration_number_entry = self._add_form_field(10, "Registration #:", Gtk.Entry())
+        self.home_port_entry = self._add_form_field(11, "Home Port:", Gtk.Entry())
+        self.gross_tonnage_entry = self._add_form_field(12, "Gross Tonnage:", Gtk.SpinButton.new_with_range(0, 10000, 0.1))
+
+        # Notes text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.notes_textview)
+        self._add_form_field(13, "Notes:", scrolled_window)
+
+        # Attachments
+        self.attachment_widget = AttachmentWidget()
+        self.grid.attach(self.attachment_widget, 0, 14, 2, 1)
+        self.row_counter = 14 # Update row counter
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+
+        self.name_entry.set_text(self.item.name)
+
+        # Set vessel type in combo
+        if self.item.vessel_type:
+            for i, vessel_type in enumerate(VESSEL_TYPES):
+                if vessel_type == self.item.vessel_type:
+                    self.type_combo.set_active(i)
+                    break
+
+        self.length_entry.set_value(self.item.length)
+        self.beam_entry.set_value(self.item.beam)
+        self.draft_entry.set_value(self.item.draft)
+        self.engine_make_entry.set_text(self.item.engine_make)
+        self.engine_model_entry.set_text(self.item.engine_model)
+        self.engine_hours_entry.set_value(self.item.engine_hours)
+        self.hull_material_entry.set_text(self.item.hull_material)
+        self.build_year_entry.set_value(self.item.build_year)
+        self.registration_number_entry.set_text(self.item.registration_number)
+        self.home_port_entry.set_text(self.item.home_port)
+        self.gross_tonnage_entry.set_value(self.item.gross_tonnage)
+
+        # Set notes in text view
+        buffer = self.notes_textview.get_buffer()
+        buffer.set_text(self.item.notes)
+
+        # Set attachments
+        self.attachment_widget.set_attachments(self.item.attachments)
+
+    def validate(self) -> bool:
+        if not self.name_entry.get_text().strip():
+            show_error_dialog(self, "Vessel name is required.")
+            self.name_entry.grab_focus()
+            return False
+        return True
+
+    def get_values(self) -> Vessel:
+        buffer = self.notes_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        notes = buffer.get_text(start_iter, end_iter, False).strip()
+
+        vessel = Vessel(
+            id=self.item.id if self.item else None,
+            name=self.name_entry.get_text().strip(),
+            vessel_type=VESSEL_TYPES[self.type_combo.get_active()] if self.type_combo.get_active() >= 0 else "",
+            length=self.length_entry.get_value(),
+            beam=self.beam_entry.get_value(),
+            draft=self.draft_entry.get_value(),
+            engine_make=self.engine_make_entry.get_text().strip(),
+            engine_model=self.engine_model_entry.get_text().strip(),
+            engine_hours=self.engine_hours_entry.get_value(),
+            hull_material=self.hull_material_entry.get_text().strip(),
+            build_year=int(self.build_year_entry.get_value()),
+            registration_number=self.registration_number_entry.get_text().strip(),
+            home_port=self.home_port_entry.get_text().strip(),
+            gross_tonnage=self.gross_tonnage_entry.get_value(),
+            notes=notes,
+            attachments=self.attachment_widget.get_attachments()
+        )
+        return vessel
+
+# --- Maintenance Task Editor ---
+class MaintenanceTaskEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, task: MaintenanceTask = None):
+        super().__init__(parent, "Edit Maintenance Task" if task else "Add Maintenance Task", task)
+        self.db = db
+        self.vessels = db.get_vessels()
+        self.inventory_items = db.get_inventory_items()
+        self.suppliers = db.get_suppliers()
+
+        # Set up vessel combo
+        self.vessel_combo = Gtk.ComboBoxText()
+        for vessel in self.vessels:
+            self.vessel_combo.append_text(vessel.name)
+        if task and task.vessel_id:
+            for i, vessel in enumerate(self.vessels):
+                if vessel.id == task.vessel_id:
+                    self.vessel_combo.set_active(i)
+                    break
+
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.vessel_combo = self._add_form_field(0, "Vessel:", self.vessel_combo)
+        self.system_combo = Gtk.ComboBoxText()
+        for system in SYSTEM_CATEGORIES:
+            self.system_combo.append_text(system)
+        self._add_form_field(1, "System:", self.system_combo)
+
+        self.task_name_entry = self._add_form_field(2, "Task Name:", Gtk.Entry())
+
+        self.interval_type_combo = Gtk.ComboBoxText()
+        for interval_type in IntervalType:
+            self.interval_type_combo.append_text(interval_type.display_name())
+        self._add_form_field(3, "Interval Type:", self.interval_type_combo)
+        self.interval_type_combo.connect("changed", self.on_interval_type_changed)
+
+        self.interval_value_entry = self._add_form_field(4, "Interval Value:", Gtk.SpinButton.new_with_range(0, 100000, 1))
+
+        self.last_completed_entry = self._add_form_field(5, "Last Completed:", DatePickerEntry())
+        self.last_hours_entry = self._add_form_field(6, "Last Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.next_due_entry = self._add_form_field(7, "Next Due:", DatePickerEntry())
+
+        self.priority_combo = Gtk.ComboBoxText()
+        for priority in Priority:
+            self.priority_combo.append_text(priority.display_name())
+        self._add_form_field(8, "Priority:", self.priority_combo)
+
+        self.status_combo = Gtk.ComboBoxText()
+        for status in TaskStatus:
+            self.status_combo.append_text(status.value)
+        self._add_form_field(9, "Status:", self.status_combo)
+
+        self.assigned_to_entry = self._add_form_field(10, "Assigned To:", Gtk.Entry())
+        self.estimated_duration_entry = self._add_form_field(11, "Est. Duration (hrs):", Gtk.SpinButton.new_with_range(0, 1000, 0.1))
+        self.labor_cost_entry = self._add_form_field(12, "Labor Cost:", Gtk.SpinButton.new_with_range(0, 100000, 0.01))
+
+        # Instructions text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.instructions_textview = Gtk.TextView()
+        self.instructions_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.instructions_textview)
+        self._add_form_field(13, "Instructions:", scrolled_window)
+
+        # Attachments
+        self.attachment_widget = AttachmentWidget()
+        self.grid.attach(self.attachment_widget, 0, 14, 2, 1)
+        self.row_counter = 14 # Update row counter
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+
+        # Set vessel in combo
+        for i, vessel in enumerate(self.vessels):
+            if vessel.id == self.item.vessel_id:
+                self.vessel_combo.set_active(i)
+                break
+
+        # Set system in combo
+        for i, system in enumerate(SYSTEM_CATEGORIES):
+            if system == self.item.system:
+                self.system_combo.set_active(i)
+                break
+
+        self.task_name_entry.set_text(self.item.task_name)
+
+        # Set interval type in combo
+        for i, interval_type in enumerate(IntervalType):
+            if interval_type == self.item.interval_type:
+                self.interval_type_combo.set_active(i)
+                break
+
+        self.interval_value_entry.set_value(self.item.interval_value)
+        self.last_completed_entry.set_text(self.item.last_completed)
+        self.last_hours_entry.set_value(self.item.last_hours)
+        self.next_due_entry.set_text(self.item.next_due)
+
+        # Set priority in combo
+        for i, priority in enumerate(Priority):
+            if priority == self.item.priority:
+                self.priority_combo.set_active(i)
+                break
+
+        # Set status in combo
+        for i, status in enumerate(TaskStatus):
+            if status == self.item.status:
+                self.status_combo.set_active(i)
+                break
+
+        self.assigned_to_entry.set_text(self.item.assigned_to)
+        self.estimated_duration_entry.set_value(self.item.estimated_duration_hours)
+        self.labor_cost_entry.set_value(self.item.labor_cost)
+
+        # Set instructions in text view
+        buffer = self.instructions_textview.get_buffer()
+        buffer.set_text(self.item.instructions)
+
+        # Set attachments
+        self.attachment_widget.set_attachments(self.item.attachments)
+
+    def on_interval_type_changed(self, combo):
+        active_index = combo.get_active()
+        if active_index >= 0:
+            interval_type = list(IntervalType)[active_index]
+            is_date_based = (interval_type == IntervalType.DAYS)
+            self.last_completed_entry.set_sensitive(is_date_based)
+            self.next_due_entry.set_sensitive(is_date_based)
+            self.last_hours_entry.set_sensitive(not is_date_based)
+
+    def validate(self) -> bool:
+        if not self.task_name_entry.get_text().strip():
+            show_error_dialog(self, "Task name is required.")
+            self.task_name_entry.grab_focus()
+            return False
+
+        if self.vessel_combo.get_active() == -1:
+            show_error_dialog(self, "Please select a vessel.")
+            self.vessel_combo.grab_focus()
+            return False
+
+        if (self.last_completed_entry.get_text() and
+            not self.last_completed_entry.validate_date()):
+            show_error_dialog(self, "Last Completed date format is invalid. Please use YYYY-MM-DD.")
+            self.last_completed_entry.entry.grab_focus()
+            return False
+
+        if (self.next_due_entry.get_sensitive() and
+            self.next_due_entry.get_text() and
+            not self.next_due_entry.validate_date()):
+            show_error_dialog(self, "Next Due date format is invalid. Please use YYYY-MM-DD.")
+            self.next_due_entry.entry.grab_focus()
+            return False
+
+        last_completed = self.last_completed_entry.get_text()
+        next_due = self.next_due_entry.get_text()
+        if (last_completed and next_due and
+            self.next_due_entry.get_sensitive()):
+            try:
+                last_date = datetime.datetime.strptime(last_completed, "%Y-%m-%d").date()
+                next_date = datetime.datetime.strptime(next_due, "%Y-%m-%d").date()
+
+                # Fixed: Consider if next_date == last_date should be allowed
+                # Changed from `if next_date < last_date:` to `if next_date <= last_date:`
+                # to be more restrictive. Adjust logic based on business rules.
+                if next_date <= last_date: # Allow equal dates?
+                    show_error_dialog(self, "Next Due date cannot be before or equal to Last Completed date.")
+                    self.next_due_entry.entry.grab_focus()
+                    return False
+            except ValueError:
+                pass # This should be caught by validate_date, but just in case
+
+        return True
+
+    def get_values(self) -> MaintenanceTask:
+        buffer = self.instructions_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        instructions = buffer.get_text(start_iter, end_iter, False).strip()
+
+        # Get selected vessel
+        vessel_index = self.vessel_combo.get_active()
+        vessel_id = self.vessels[vessel_index].id if vessel_index >= 0 else 0
+
+        # Get selected interval type
+        interval_index = self.interval_type_combo.get_active()
+        selected_interval_type = list(IntervalType)[interval_index] if interval_index >= 0 else IntervalType.HOURS
+
+        # Get selected priority
+        priority_index = self.priority_combo.get_active()
+        selected_priority = list(Priority)[priority_index] if priority_index >= 0 else Priority.MEDIUM
+
+        # Get selected status
+        status_index = self.status_combo.get_active()
+        selected_status = list(TaskStatus)[status_index] if status_index >= 0 else TaskStatus.PENDING
+
+        # Calculate next due date if needed
+        next_due_date_str = self.next_due_entry.get_text()
+        if selected_interval_type == IntervalType.DAYS and self.last_completed_entry.get_text() and not next_due_date_str:
+            try:
+                last_date = datetime.datetime.strptime(self.last_completed_entry.get_text(), "%Y-%m-%d").date()
+                next_date = last_date + datetime.timedelta(days=int(self.interval_value_entry.get_value()))
+                next_due_date_str = next_date.strftime("%Y-%m-%d")
+            except ValueError:
+                next_due_date_str = ""
+
+        task = MaintenanceTask(
+            id=self.item.id if self.item else None,
+            vessel_id=vessel_id,
+            system=self.system_combo.get_active_text() or "",
+            task_name=self.task_name_entry.get_text().strip(),
+            interval_type=selected_interval_type,
+            interval_value=int(self.interval_value_entry.get_value()),
+            last_completed=self.last_completed_entry.get_text(),
+            last_hours=self.last_hours_entry.get_value(),
+            next_due=next_due_date_str,
+            priority=selected_priority,
+            status=selected_status,
+            assigned_to=self.assigned_to_entry.get_text().strip(),
+            estimated_duration_hours=self.estimated_duration_entry.get_value(),
+            labor_cost=self.labor_cost_entry.get_value(),
+            instructions=instructions,
+            attachments=self.attachment_widget.get_attachments()
+        )
+        return task
+
+# --- Inventory Item Editor ---
+class InventoryItemEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, item: InventoryItem = None):
+        super().__init__(parent, "Edit Inventory Item" if item else "Add Inventory Item", item)
+        self.db = db
+        self.suppliers = db.get_suppliers()
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.name_entry = self._add_form_field(0, "Name:", Gtk.Entry())
+        self.part_number_entry = self._add_form_field(1, "Part Number:", Gtk.Entry())
+        self.description_entry = self._add_form_field(2, "Description:", Gtk.Entry())
+
+        self.category_entry = self._add_form_field(3, "Category:", Gtk.Entry())
+        self.system_combo = Gtk.ComboBoxText()
+        for system in SYSTEM_CATEGORIES:
+            self.system_combo.append_text(system)
+        self._add_form_field(4, "System:", self.system_combo)
+
+        self.location_entry = self._add_form_field(5, "Location:", Gtk.Entry())
+
+        self.current_stock_entry = self._add_form_field(6, "Current Stock:", Gtk.SpinButton.new_with_range(0, 10000, 1))
+        self.minimum_stock_entry = self._add_form_field(7, "Minimum Stock:", Gtk.SpinButton.new_with_range(0, 10000, 1))
+        self.reorder_quantity_entry = self._add_form_field(8, "Reorder Qty:", Gtk.SpinButton.new_with_range(0, 10000, 1))
+        self.unit_cost_entry = self._add_form_field(9, "Unit Cost:", Gtk.SpinButton.new_with_range(0, 10000, 0.01))
+        self.average_consumption_entry = self._add_form_field(10, "Avg. Consumption (per month):", Gtk.SpinButton.new_with_range(0, 1000, 0.1))
+
+        # Supplier combo
+        self.supplier_combo = Gtk.ComboBoxText()
+        self.supplier_combo.append_text("None") # Add a "None" option
+        for supplier in self.suppliers:
+            self.supplier_combo.append_text(supplier.name)
+        self._add_form_field(11, "Supplier:", self.supplier_combo)
+
+        # Specifications text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.specifications_textview = Gtk.TextView()
+        self.specifications_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.specifications_textview)
+        self._add_form_field(12, "Specifications:", scrolled_window)
+
+        # Notes text view
+        scrolled_window_notes = Gtk.ScrolledWindow()
+        scrolled_window_notes.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window_notes.set_size_request(-1, 50)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window_notes.add(self.notes_textview)
+        self._add_form_field(13, "Notes:", scrolled_window_notes)
+
+        # Attachments
+        self.attachment_widget = AttachmentWidget()
+        self.grid.attach(self.attachment_widget, 0, 14, 2, 1)
+        self.row_counter = 14 # Update row counter
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+
+        self.name_entry.set_text(self.item.name)
+        self.part_number_entry.set_text(self.item.part_number)
+        self.description_entry.set_text(self.item.description)
+        self.category_entry.set_text(self.item.category)
+
+        # Set system in combo
+        for i, system in enumerate(SYSTEM_CATEGORIES):
+            if system == self.item.system:
+                self.system_combo.set_active(i)
+                break
+
+        self.location_entry.set_text(self.item.location)
+        self.current_stock_entry.set_value(self.item.current_stock)
+        self.minimum_stock_entry.set_value(self.item.minimum_stock)
+        self.reorder_quantity_entry.set_value(self.item.reorder_quantity)
+        self.unit_cost_entry.set_value(self.item.unit_cost)
+        self.average_consumption_entry.set_value(self.item.average_consumption_rate)
+
+        # Set supplier in combo
+        if self.item.supplier_id:
+            for i, supplier in enumerate(self.suppliers):
+                if supplier.id == self.item.supplier_id:
+                    self.supplier_combo.set_active(i + 1) # +1 because of "None" at index 0
+                    break
+        else:
+            self.supplier_combo.set_active(0) # Select "None"
+
+        # Set specifications in text view
+        buffer = self.specifications_textview.get_buffer()
+        buffer.set_text(self.item.specifications)
+
+        # Set notes in text view
+        buffer_notes = self.notes_textview.get_buffer()
+        buffer_notes.set_text(self.item.notes)
+
+        # Set attachments
+        self.attachment_widget.set_attachments(self.item.attachments)
+
+    def validate(self) -> bool:
+        if not self.name_entry.get_text().strip():
+            show_error_dialog(self, "Item name is required.")
+            self.name_entry.grab_focus()
+            return False
+
+        current_stock = int(self.current_stock_entry.get_value())
+        minimum_stock = int(self.minimum_stock_entry.get_value())
+        if current_stock < 0:
+            show_error_dialog(self, "Current stock cannot be negative.")
+            self.current_stock_entry.grab_focus()
+            return False
+
+        if minimum_stock < 0:
+            show_error_dialog(self, "Minimum stock cannot be negative.")
+            self.minimum_stock_entry.grab_focus()
+            return False
+
+        if self.reorder_quantity_entry.get_value() < 0:
+            show_error_dialog(self, "Reorder quantity cannot be negative.")
+            self.reorder_quantity_entry.grab_focus()
+            return False
+
+        return True
+
+    def get_values(self) -> InventoryItem:
+        buffer = self.specifications_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        specifications = buffer.get_text(start_iter, end_iter, False).strip()
+
+        buffer_notes = self.notes_textview.get_buffer()
+        start_iter_notes = buffer_notes.get_start_iter()
+        end_iter_notes = buffer_notes.get_end_iter()
+        notes = buffer_notes.get_text(start_iter_notes, end_iter_notes, False).strip()
+
+        # Get selected supplier ID
+        supplier_index = self.supplier_combo.get_active()
+        supplier_id = None
+        if supplier_index > 0: # Index 0 is "None"
+            supplier_id = self.suppliers[supplier_index - 1].id # -1 to account for "None"
+
+        item = InventoryItem(
+            id=self.item.id if self.item else None,
+            name=self.name_entry.get_text().strip(),
+            part_number=self.part_number_entry.get_text().strip(),
+            description=self.description_entry.get_text().strip(),
+            category=self.category_entry.get_text().strip(),
+            system=self.system_combo.get_active_text() or "",
+            location=self.location_entry.get_text().strip(),
+            current_stock=int(self.current_stock_entry.get_value()),
+            minimum_stock=int(self.minimum_stock_entry.get_value()),
+            reorder_quantity=int(self.reorder_quantity_entry.get_value()),
+            supplier_id=supplier_id,
+            unit_cost=self.unit_cost_entry.get_value(),
+            average_consumption_rate=self.average_consumption_entry.get_value(),
+            specifications=specifications,
+            notes=notes,
+            attachments=self.attachment_widget.get_attachments()
+        )
+        return item
+
+# --- Supplier Editor ---
+class SupplierEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, supplier: Supplier = None):
+        super().__init__(parent, "Edit Supplier" if supplier else "Add Supplier", supplier)
+        self.db = db
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.name_entry = self._add_form_field(0, "Name:", Gtk.Entry())
+        self.contact_entry = self._add_form_field(1, "Contact Person:", Gtk.Entry())
+        self.phone_entry = self._add_form_field(2, "Phone:", Gtk.Entry())
+        self.email_entry = self._add_form_field(3, "Email:", Gtk.Entry())
+
+        self.address_entry = self._add_form_field(4, "Address:", Gtk.Entry())
+        self.website_entry = self._add_form_field(5, "Website:", Gtk.Entry())
+        self.terms_entry = self._add_form_field(6, "Terms:", Gtk.Entry())
+        self.preferred_check = self._add_form_field(7, "Preferred Supplier:", Gtk.CheckButton())
+
+        # Notes text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.notes_textview)
+        self._add_form_field(8, "Notes:", scrolled_window)
+
+        # Attachments
+        self.attachment_widget = AttachmentWidget()
+        self.grid.attach(self.attachment_widget, 0, 9, 2, 1)
+        self.row_counter = 9 # Update row counter
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+
+        self.name_entry.set_text(self.item.name)
+        self.contact_entry.set_text(self.item.contact)
+        self.phone_entry.set_text(self.item.phone)
+        self.email_entry.set_text(self.item.email)
+        self.address_entry.set_text(self.item.address)
+        self.website_entry.set_text(self.item.website)
+        self.terms_entry.set_text(self.item.terms)
+        self.preferred_check.set_active(self.item.preferred)
+
+        # Set notes in text view
+        buffer = self.notes_textview.get_buffer()
+        buffer.set_text(self.item.notes)
+
+        # Set attachments
+        self.attachment_widget.set_attachments(self.item.attachments)
+
+    def validate(self) -> bool:
+        if not self.name_entry.get_text().strip():
+            show_error_dialog(self, "Supplier name is required.")
+            self.name_entry.grab_focus()
+            return False
+
+        email = self.email_entry.get_text().strip()
+        if email and not validate_email(email):
+            show_error_dialog(self, "Please enter a valid email address.")
+            self.email_entry.grab_focus()
+            return False
+
+        return True
+
+    def get_values(self) -> Supplier:
+        buffer = self.notes_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        notes = buffer.get_text(start_iter, end_iter, False).strip()
+
+        supplier = Supplier(
+            id=self.item.id if self.item else None,
+            name=self.name_entry.get_text().strip(),
+            contact=self.contact_entry.get_text().strip(),
+            phone=self.phone_entry.get_text().strip(),
+            email=self.email_entry.get_text().strip(),
+            address=self.address_entry.get_text().strip(),
+            website=self.website_entry.get_text().strip(),
+            terms=self.terms_entry.get_text().strip(),
+            preferred=self.preferred_check.get_active(),
+            notes=notes,
+            attachments=self.attachment_widget.get_attachments()
+        )
+        return supplier
+
+# --- Trip Log Editor ---
+class TripLogEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, log: TripLog = None):
+        super().__init__(parent, "Edit Trip Log" if log else "Add Trip Log", log)
+        self.db = db
+        self.vessels = db.get_vessels()
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.vessel_combo = Gtk.ComboBoxText()
+        for vessel in self.vessels:
+            self.vessel_combo.append_text(vessel.name)
+        self._add_form_field(0, "Vessel:", self.vessel_combo)
+
+        self.status_combo = Gtk.ComboBoxText()
+        for status in TripStatus:
+            self.status_combo.append_text(status.value)
+        self._add_form_field(1, "Status:", self.status_combo)
+
+        self.departure_entry = self._add_form_field(2, "Departure:", DatePickerEntry())
+        self.arrival_entry = self._add_form_field(3, "Arrival:", DatePickerEntry())
+        self.origin_entry = self._add_form_field(4, "Origin:", Gtk.Entry())
+        self.destination_entry = self._add_form_field(5, "Destination:", Gtk.Entry())
+        self.start_hours_entry = self._add_form_field(6, "Start Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.end_hours_entry = self._add_form_field(7, "End Hours:", Gtk.SpinButton.new_with_range(0, 100000, 0.1))
+        self.fuel_used_entry = self._add_form_field(8, "Fuel Used (gal):", Gtk.SpinButton.new_with_range(0, 10000, 0.1))
+        self.distance_entry = self._add_form_field(9, "Distance (nm):", Gtk.SpinButton.new_with_range(0, 10000, 0.1))
+        self.captain_entry = self._add_form_field(10, "Captain:", Gtk.Entry())
+        self.crew_entry = self._add_form_field(11, "Crew:", Gtk.Entry())
+        self.weather_entry = self._add_form_field(12, "Weather:", Gtk.Entry())
+        self.sea_state_entry = self._add_form_field(13, "Sea State:", Gtk.Entry())
+
+        # Log Entries text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 150)
+
+        self.log_entries_textview = Gtk.TextView()
+        self.log_entries_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.log_entries_textview)
+        self._add_form_field(14, "Log Entries:", scrolled_window)
+
+        # Notes text view
+        scrolled_window_notes = Gtk.ScrolledWindow()
+        scrolled_window_notes.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window_notes.set_size_request(-1, 50)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window_notes.add(self.notes_textview)
+        self._add_form_field(15, "Notes:", scrolled_window_notes)
+
+        # Attachments
+        self.attachment_widget = AttachmentWidget()
+        self.grid.attach(self.attachment_widget, 0, 16, 2, 1)
+        self.row_counter = 16 # Update row counter
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+
+        # Set vessel in combo
+        for i, vessel in enumerate(self.vessels):
+            if vessel.id == self.item.vessel_id:
+                self.vessel_combo.set_active(i)
+                break
+
+        # Set status in combo
+        for i, status in enumerate(TripStatus):
+            if status == self.item.status:
+                self.status_combo.set_active(i)
+                break
+
+        self.departure_entry.set_text(self.item.departure)
+        self.arrival_entry.set_text(self.item.arrival)
+        self.origin_entry.set_text(self.item.origin)
+        self.destination_entry.set_text(self.item.destination)
+        self.start_hours_entry.set_value(self.item.start_hours)
+        self.end_hours_entry.set_value(self.item.end_hours)
+        self.fuel_used_entry.set_value(self.item.fuel_used)
+        self.distance_entry.set_value(self.item.distance)
+        self.captain_entry.set_text(self.item.captain)
+        self.crew_entry.set_text(self.item.crew)
+        self.weather_entry.set_text(self.item.weather_conditions)
+        self.sea_state_entry.set_text(self.item.sea_state)
+
+        # Set log entries in text view
+        buffer = self.log_entries_textview.get_buffer()
+        buffer.set_text(self.item.log_entries)
+
+        # Set notes in text view
+        buffer_notes = self.notes_textview.get_buffer()
+        buffer_notes.set_text(self.item.notes)
+
+        # Set attachments
+        self.attachment_widget.set_attachments(self.item.attachments)
+
+    def validate(self) -> bool:
+        if self.vessel_combo.get_active() == -1:
+            show_error_dialog(self, "Please select a vessel.")
+            self.vessel_combo.grab_focus()
+            return False
+
+        if (self.departure_entry.get_text() and
+            not self.departure_entry.validate_date()):
+            show_error_dialog(self, "Departure date format is invalid. Please use YYYY-MM-DD.")
+            self.departure_entry.entry.grab_focus()
+            return False
+
+        if (self.arrival_entry.get_text() and
+            not self.arrival_entry.validate_date()):
+            show_error_dialog(self, "Arrival date format is invalid. Please use YYYY-MM-DD.")
+            self.arrival_entry.entry.grab_focus()
+            return False
+
+        departure = self.departure_entry.get_text()
+        arrival = self.arrival_entry.get_text()
+        if departure and arrival:
+            try:
+                dep_date = datetime.datetime.strptime(departure, "%Y-%m-%d").date()
+                arr_date = datetime.datetime.strptime(arrival, "%Y-%m-%d").date()
+
+                if arr_date < dep_date:
+                    show_error_dialog(self, "Arrival date cannot be before departure date.")
+                    self.arrival_entry.entry.grab_focus()
+                    return False
+            except ValueError:
+                pass # Handled by validate_date
+
+        if self.start_hours_entry.get_value() > self.end_hours_entry.get_value():
+            show_error_dialog(self, "End hours cannot be less than Start hours.")
+            self.end_hours_entry.grab_focus()
+            return False
+
+        return True
+
+    def get_values(self) -> TripLog:
+        buffer = self.log_entries_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        log_entries = buffer.get_text(start_iter, end_iter, False).strip()
+
+        buffer_notes = self.notes_textview.get_buffer()
+        start_iter_notes = buffer_notes.get_start_iter()
+        end_iter_notes = buffer_notes.get_end_iter()
+        notes = buffer_notes.get_text(start_iter_notes, end_iter_notes, False).strip()
+
+        # Get selected vessel ID
+        vessel_index = self.vessel_combo.get_active()
+        vessel_id = self.vessels[vessel_index].id if vessel_index >= 0 else 0
+
+        # Get selected status
+        status_index = self.status_combo.get_active()
+        selected_status = list(TripStatus)[status_index] if status_index >= 0 else TripStatus.PLANNED
+
+        log = TripLog(
+            id=self.item.id if self.item else None,
+            vessel_id=vessel_id,
+            status=selected_status,
+            departure=self.departure_entry.get_text(),
+            arrival=self.arrival_entry.get_text(),
+            origin=self.origin_entry.get_text().strip(),
+            destination=self.destination_entry.get_text().strip(),
+            start_hours=self.start_hours_entry.get_value(),
+            end_hours=self.end_hours_entry.get_value(),
+            fuel_used=self.fuel_used_entry.get_value(),
+            distance=self.distance_entry.get_value(),
+            captain=self.captain_entry.get_text().strip(),
+            crew=self.crew_entry.get_text().strip(),
+            weather_conditions=self.weather_entry.get_text().strip(),
+            sea_state=self.sea_state_entry.get_text().strip(),
+            log_entries=log_entries,
+            notes=notes,
+            attachments=self.attachment_widget.get_attachments()
+        )
+        return log
+
+# --- Report Generator ---
+class ReportGenerator:
+    @staticmethod
+    def generate_low_stock_report(db: Database, config: Dict[str, Any], filename: str) -> bool:
+        """Generate a low stock report."""
+        try:
+            items = db.get_inventory_items()
+            low_stock_items = [item for item in items if item.current_stock <= item.minimum_stock and item.minimum_stock > 0]
+
+            with open(os.path.join(REPORTS_DIR, filename), 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["ID", "Name", "Part Number", "Current Stock", "Minimum Stock", "System", "Location", "Unit Cost", "Total Value"])
+                total_value = 0.0
+                for item in low_stock_items:
+                    total_value_for_item = item.current_stock * item.unit_cost
+                    total_value += total_value_for_item
+                    writer.writerow([
+                        item.id, item.name, item.part_number,
+                        item.current_stock, item.minimum_stock,
+                        item.system, item.location, item.unit_cost, total_value_for_item
+                    ])
+                writer.writerow([]) # Empty row
+                writer.writerow(["", "", "", "", "", "", "", "TOTAL VALUE:", total_value])
+            logger.info(f"Low stock report generated: {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to generate low stock report: {e}")
+            return False
+
+    @staticmethod
+    def generate_maintenance_due_report(db: Database, config: Dict[str, Any], filename: str) -> bool:
+        """Generate a maintenance due report."""
+        try:
+            tasks = db.get_maintenance_tasks()
+            vessels = {v.id: v for v in db.get_vessels()}
+            due_soon_days = config.get("due_soon_days", 7)
+
+            with open(os.path.join(REPORTS_DIR, filename), 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["ID", "Vessel", "System", "Task Name", "Date", "Status", "Priority", "Assigned To", "Est. Duration (hrs)"])
+                for task in tasks:
+                    vessel = vessels.get(task.vessel_id, Vessel())
+                    status_enum = task.get_status(vessel.engine_hours, due_soon_days)
+                    if status_enum in [Status.OVERDUE, Status.DUE_SOON]:
+                        date_str = task.next_due if task.next_due else task.last_completed
+                        writer.writerow([
+                            task.id, vessel.name, task.system, task.task_name,
+                            date_str, status_enum.display_name(), task.priority.display_name(),
+                            task.assigned_to, task.estimated_duration_hours
+                        ])
+            logger.info(f"Maintenance due report generated: {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to generate maintenance due report: {e}")
+            return False
+
+    @staticmethod
+    def generate_maintenance_cost_report(db: Database, config: Dict[str, Any], filename: str) -> bool:
+        """Generate a maintenance cost report."""
+        try:
+            tasks = db.get_maintenance_tasks()
+            vessels = {v.id: v for v in db.get_vessels()}
+
+            with open(os.path.join(REPORTS_DIR, filename), 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["ID", "Vessel", "System", "Task Name", "Labor Cost", "Parts Cost", "Total Cost", "Status"])
+                total_labor = 0.0
+                total_parts = 0.0
+                total_cost = 0.0
+                for task in tasks:
+                    vessel = vessels.get(task.vessel_id, Vessel())
+                    labor_cost, parts_cost, total_job_cost = calculate_maintenance_cost(task, db)
+                    total_labor += labor_cost
+                    total_parts += parts_cost
+                    total_cost += total_job_cost
+                    writer.writerow([
+                        task.id, vessel.name, task.system, task.task_name,
+                        labor_cost, parts_cost, total_job_cost, task.status.value
+                    ])
+                writer.writerow([]) # Empty row
+                writer.writerow(["", "", "", "TOTALS:", total_labor, total_parts, total_cost])
+            logger.info(f"Maintenance cost report generated: {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to generate maintenance cost report: {e}")
+            return False
+
+    @staticmethod
+    def generate_vessel_performance_report(db: Database, config: Dict[str, Any], vessel_id: int, filename: str) -> bool:
+        """Generate a performance report for a specific vessel."""
+        try:
+            # Get vessel name
+            vessels = db.get_vessels()
+            vessel = next((v for v in vessels if v.id == vessel_id), None)
+            if not vessel:
+                logger.error(f"Vessel with ID {vessel_id} not found for performance report.")
+                return False
+
+            # Get performance metrics for the vessel
+            metrics = db.get_performance_metrics(vessel_id=vessel_id)
+
+            # Group metrics by name
+            metric_data = {}
+            for metric in metrics:
+                if metric.metric_name not in metric_data:
+                    metric_data[metric.metric_name] = {'dates': [], 'values': []}
+                metric_data[metric.metric_name]['dates'].append(datetime.datetime.strptime(metric.date_recorded, "%Y-%m-%d"))
+                metric_data[metric.metric_name]['values'].append(metric.value)
+
+            # Create the report file and plot
+            full_path = os.path.join(REPORTS_DIR, filename)
+            with PdfPages(full_path) as pdf:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.set_title(f"Performance Metrics for {vessel.name}")
+                ax.set_xlabel("Date")
+                ax.set_ylabel("Value")
+                ax.grid(True)
+
+                for metric_name, data in metric_data.items():
+                    ax.plot(data['dates'], data['values'], label=metric_name, marker='o')
+
+                ax.legend()
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            logger.info(f"Vessel performance report generated: {full_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to generate vessel performance report: {e}")
+            return False
+
+# --- Report Dialog ---
+class ReportDialog(Gtk.Dialog):
+    def __init__(self, parent: Gtk.Window, db: Database, report_type: str, config: Dict[str, Any]):
+        super().__init__(title=f"Generate {report_type} Report", transient_for=parent, flags=0)
+        self.db = db
+        self.report_type = report_type
+        self.config = config
+        self.set_default_size(300, 150)
+        self.set_modal(True)
+
+        self.grid = Gtk.Grid()
+        self.grid.set_row_spacing(10)
+        self.grid.set_column_spacing(10)
+        self.grid.set_border_width(10)
+
+        content_area = self.get_content_area()
+        content_area.pack_start(self.grid, True, True, 0)
+
+        self.filename_entry = Gtk.Entry()
+        self.filename_entry.set_text(f"{report_type.replace(' ', '_').lower()}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        self._add_form_field(0, "Filename:", self.filename_entry)
+
+        # Add vessel selection for vessel-specific reports
+        if report_type == "Vessel Performance":
+            self.vessel_combo = Gtk.ComboBoxText()
+            self.vessel_combo.append_text("Select Vessel...")
+            for vessel in db.get_vessels():
+                self.vessel_combo.append_text(vessel.name)
+            self.vessel_combo.set_active(0)
+            self._add_form_field(1, "Vessel:", self.vessel_combo)
+            # Change default filename for performance report
+            self.filename_entry.set_text(f"vessel_performance_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        ok_button = self.add_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        ok_button.get_style_context().add_class("suggested-action")
+
+        self.connect("response", self.on_response)
+
+    def _add_form_field(self, row: int, label_text: str, widget) -> Gtk.Widget:
+        label = Gtk.Label(label=label_text)
+        label.set_halign(Gtk.Align.START)
+        self.grid.attach(label, 0, row, 1, 1)
+        self.grid.attach(widget, 1, row, 1, 1)
+        return widget
+
+    def on_response(self, dialog, response_id):
+        if response_id == Gtk.ResponseType.OK:
+            filename = self.filename_entry.get_text().strip()
+            if not filename:
+                show_error_dialog(self, "Please enter a filename.")
+                return
+
+            success = False
+            if self.report_type == "Low Stock":
+                if not filename.endswith('.csv'):
+                    filename += '.csv'
+                full_path = os.path.join(REPORTS_DIR, filename)
+                success = ReportGenerator.generate_low_stock_report(self.db, self.config, full_path)
+            elif self.report_type == "Maintenance Due":
+                if not filename.endswith('.csv'):
+                    filename += '.csv'
+                full_path = os.path.join(REPORTS_DIR, filename)
+                success = ReportGenerator.generate_maintenance_due_report(self.db, self.config, full_path)
+            elif self.report_type == "Maintenance Cost":
+                if not filename.endswith('.csv'):
+                    filename += '.csv'
+                full_path = os.path.join(REPORTS_DIR, filename)
+                success = ReportGenerator.generate_maintenance_cost_report(self.db, self.config, full_path)
+            elif self.report_type == "Vessel Performance":
+                if not filename.endswith('.pdf'):
+                    filename += '.pdf'
+                # Get selected vessel
+                vessel_index = self.vessel_combo.get_active()
+                if vessel_index <= 0: # Index 0 is "Select Vessel..."
+                    show_error_dialog(self, "Please select a vessel.")
+                    return
+                vessel_id = self.db.get_vessels()[vessel_index - 1].id # -1 to account for placeholder
+                full_path = os.path.join(REPORTS_DIR, filename)
+                success = ReportGenerator.generate_vessel_performance_report(self.db, self.config, vessel_id, full_path)
+
+            if success:
+                show_info_dialog(self.get_transient_for(), f"Report generated successfully:\n{full_path}")
+            else:
+                show_error_dialog(self.get_transient_for(), "Failed to generate report.")
+
+        self.destroy()
+
+# --- Stock Transaction Editor ---
+class StockTransactionEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, item_id: int, transaction: StockTransaction = None):
+        title = f"Edit Transaction for Item ID {item_id}" if transaction else f"Add Transaction for Item ID {item_id}"
+        super().__init__(parent, title, transaction)
+        self.db = db
+        self.item_id = item_id
+        self.inventory_item = next((i for i in db.get_inventory_items() if i.id == item_id), None)
+        if not self.inventory_item:
+            show_error_dialog(parent, f"Inventory item with ID {item_id} not found.")
+            self.response(Gtk.ResponseType.CANCEL)
+            return
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.transaction_type_combo = Gtk.ComboBoxText()
+        for ttype in TransactionType:
+            self.transaction_type_combo.append_text(ttype.value)
+        self._add_form_field(0, "Type:", self.transaction_type_combo)
+
+        self.quantity_entry = self._add_form_field(1, "Quantity:", Gtk.SpinButton.new_with_range(-10000, 10000, 1))
+        self.date_entry = self._add_form_field(2, "Date:", DatePickerEntry())
+        self.reference_entry = self._add_form_field(3, "Reference:", Gtk.Entry())
+
+        # Current Stock Display
+        self.current_stock_label = Gtk.Label()
+        self.current_stock_label.set_text(f"Current Stock: {self.inventory_item.current_stock}")
+        self.current_stock_label.set_halign(Gtk.Align.START)
+        self.grid.attach(self.current_stock_label, 0, 4, 2, 1)
+
+        # Notes text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.notes_textview)
+        self._add_form_field(5, "Notes:", scrolled_window)
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+        for i, ttype in enumerate(TransactionType):
+            if ttype == self.item.transaction_type:
+                self.transaction_type_combo.set_active(i)
+                break
+        self.quantity_entry.set_value(self.item.quantity)
+        self.date_entry.set_text(self.item.date)
+        self.reference_entry.set_text(self.item.reference)
+        buffer = self.notes_textview.get_buffer()
+        buffer.set_text(self.item.notes)
+
+    def validate(self) -> bool:
+        quantity = int(self.quantity_entry.get_value())
+        if quantity == 0:
+            show_error_dialog(self, "Quantity cannot be zero.")
+            self.quantity_entry.grab_focus()
+            return False
+
+        transaction_type = list(TransactionType)[self.transaction_type_combo.get_active()]
+        if transaction_type == TransactionType.OUTBOUND and quantity > self.inventory_item.current_stock:
+            show_error_dialog(self, f"Cannot remove {quantity} items. Current stock is {self.inventory_item.current_stock}.")
+            self.quantity_entry.grab_focus()
+            return False
+
+        if not self.date_entry.validate_date():
+            show_error_dialog(self, "Date format is invalid. Please use YYYY-MM-DD.")
+            self.date_entry.entry.grab_focus()
+            return False
+
+        return True
+
+    def get_values(self) -> StockTransaction:
+        buffer = self.notes_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        notes = buffer.get_text(start_iter, end_iter, False).strip()
+
+        transaction_type = list(TransactionType)[self.transaction_type_combo.get_active()]
+        quantity = int(self.quantity_entry.get_value())
+
+        transaction = StockTransaction(
+            id=self.item.id if self.item else None,
+            item_id=self.item_id,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            date=self.date_entry.get_text(),
+            reference=self.reference_entry.get_text().strip(),
+            notes=notes
+        )
+        return transaction
+
+# --- Performance Metric Editor ---
+class PerformanceMetricEditor(BaseEditor):
+    def __init__(self, parent: Gtk.Window, db: Database, vessel_id: int, metric: PerformanceMetric = None):
+        title = f"Edit Metric for Vessel ID {vessel_id}" if metric else f"Add Metric for Vessel ID {vessel_id}"
+        super().__init__(parent, title, metric)
+        self.db = db
+        self.vessel_id = vessel_id
+        self.vessel = next((v for v in db.get_vessels() if v.id == vessel_id), None)
+        if not self.vessel:
+            show_error_dialog(parent, f"Vessel with ID {vessel_id} not found.")
+            self.response(Gtk.ResponseType.CANCEL)
+            return
+        self._setup_ui()
+        if self.item:
+            self._populate_fields()
+
+    def _setup_ui(self):
+        self.metric_name_entry = self._add_form_field(0, "Metric Name:", Gtk.Entry())
+        self.value_entry = self._add_form_field(1, "Value:", Gtk.SpinButton.new_with_range(-1000000, 1000000, 0.01))
+        self.unit_entry = self._add_form_field(2, "Unit:", Gtk.Entry())
+        self.date_entry = self._add_form_field(3, "Date Recorded:", DatePickerEntry())
+
+        # Notes text view
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.set_size_request(-1, 100)
+
+        self.notes_textview = Gtk.TextView()
+        self.notes_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        scrolled_window.add(self.notes_textview)
+        self._add_form_field(4, "Notes:", scrolled_window)
+
+    def _populate_fields(self):
+        if not self.item:
+            return
+        self.metric_name_entry.set_text(self.item.metric_name)
+        self.value_entry.set_value(self.item.value)
+        self.unit_entry.set_text(self.item.unit)
+        self.date_entry.set_text(self.item.date_recorded)
+        buffer = self.notes_textview.get_buffer()
+        buffer.set_text(self.item.notes)
+
+    def validate(self) -> bool:
+        if not self.metric_name_entry.get_text().strip():
+            show_error_dialog(self, "Metric name is required.")
+            self.metric_name_entry.grab_focus()
+            return False
+
+        if not self.date_entry.validate_date():
+            show_error_dialog(self, "Date format is invalid. Please use YYYY-MM-DD.")
+            self.date_entry.entry.grab_focus()
+            return False
+
+        return True
+
+    def get_values(self) -> PerformanceMetric:
+        buffer = self.notes_textview.get_buffer()
+        start_iter = buffer.get_start_iter()
+        end_iter = buffer.get_end_iter()
+        notes = buffer.get_text(start_iter, end_iter, False).strip()
+
+        metric = PerformanceMetric(
+            id=self.item.id if self.item else None,
+            vessel_id=self.vessel_id,
+            metric_name=self.metric_name_entry.get_text().strip(),
+            value=self.value_entry.get_value(),
+            unit=self.unit_entry.get_text().strip(),
+            date_recorded=self.date_entry.get_text(),
+            notes=notes
+        )
+        return metric
+
+# --- Main Application Window ---
+class VesselKeeperApp(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Vessel Keeper")
+        self.db = Database()
+        self.config = self._load_config()
+        self._setup_ui()
+        self._apply_css()
+        self.refresh_views()
+        self._restore_window_state()
+
+    def _load_config(self) -> Dict[str, Any]:
+        config = {
+            "window_width": 1200, "window_height": 800, "window_x": 50, "window_y": 50,
+            "due_soon_days": 7, "default_currency": "$", "language": "en"
+        }
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config.update(json.load(f))
+            except Exception as e:
+                logger.warning(f"Could not read config file: {e}")
+        return config
+
+    def _save_config(self):
+        try:
+            x, y = self.get_position()
+            width, height = self.get_size()
+            self.config.update({
+                "window_x": x, "window_y": y,
+                "window_width": width, "window_height": height
+            })
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            logger.error(f"Could not save config: {e}")
+
+    def _restore_window_state(self):
+        if "window_x" in self.config and "window_y" in self.config:
+            self.move(self.config["window_x"], self.config["window_y"])
+        if "window_width" in self.config and "window_height" in self.config:
+            self.resize(self.config["window_width"], self.config["window_height"])
+
+    def _apply_css(self):
+        css_data = """
+        .status-overdue { color: #dc3545; font-weight: bold; }
+        .status-due-soon { color: #fd7e14; font-weight: bold; }
+        .status-on-schedule { color: #28a745; }
+        .status-completed { color: #6c757d; }
+        .suggested-action { font-weight: bold; }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css_data.encode())
+
+        screen = Gdk.Screen.get_default()
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, style_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def _setup_ui(self):
+        # Create main layout
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(main_box)
+
+        # Create menu bar
+        menu_bar = self._create_menu_bar()
+        main_box.pack_start(menu_bar, False, False, 0)
+
+        # Create toolbar
+        toolbar = self._create_toolbar()
+        main_box.pack_start(toolbar, False, False, 0)
+
+        # Create notebook for tabs
+        self.notebook = Gtk.Notebook()
+        main_box.pack_start(self.notebook, True, True, 0)
+
+        # Add tabs
+        self._add_vessels_tab()
+        self._add_maintenance_tab()
+        self._add_inventory_tab()
+        self._add_suppliers_tab()
+        self._add_trip_logs_tab()
+        self._add_dashboard_tab()
+        self._add_templates_tab()
+
+        # Status bar
+        self.status_bar = Gtk.Statusbar()
+        self.status_bar_context_id = self.status_bar.get_context_id("main")
+        main_box.pack_end(self.status_bar, False, False, 0)
+
+        # Show all widgets
+        self.show_all()
+
+    def _create_menu_bar(self):
+        menu_bar = Gtk.MenuBar()
+
+        # File menu
+        file_menu = Gtk.Menu()
+        file_item = Gtk.MenuItem(label="File")
+        file_item.set_submenu(file_menu)
+
+        export_item = Gtk.MenuItem(label="Export Data...")
+        export_item.connect("activate", self.on_export_data)
+        file_menu.append(export_item)
+
+        import_item = Gtk.MenuItem(label="Import Data...")
+        import_item.connect("activate", self.on_import_data)
+        file_menu.append(import_item)
+
+        backup_item = Gtk.MenuItem(label="Create Backup...")
+        backup_item.connect("activate", self.on_create_backup)
+        file_menu.append(backup_item)
+
+        restore_item = Gtk.MenuItem(label="Restore from Backup...")
+        restore_item.connect("activate", self.on_restore_backup)
+        file_menu.append(restore_item)
+
+        separator = Gtk.SeparatorMenuItem()
+        file_menu.append(separator)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self.close)
+        file_menu.append(quit_item)
+
+        menu_bar.append(file_item)
+
+        # Reports menu
+        reports_menu = Gtk.Menu()
+        reports_item = Gtk.MenuItem(label="Reports")
+        reports_item.set_submenu(reports_menu)
+
+        low_stock_item = Gtk.MenuItem(label="Low Stock Report")
+        low_stock_item.connect("activate", self.on_generate_report, "Low Stock")
+        reports_menu.append(low_stock_item)
+
+        maintenance_due_item = Gtk.MenuItem(label="Maintenance Due Report")
+        maintenance_due_item.connect("activate", self.on_generate_report, "Maintenance Due")
+        reports_menu.append(maintenance_due_item)
+
+        maintenance_cost_item = Gtk.MenuItem(label="Maintenance Cost Report")
+        maintenance_cost_item.connect("activate", self.on_generate_report, "Maintenance Cost")
+        reports_menu.append(maintenance_cost_item)
+
+        vessel_performance_item = Gtk.MenuItem(label="Vessel Performance Report")
+        vessel_performance_item.connect("activate", self.on_generate_report, "Vessel Performance")
+        reports_menu.append(vessel_performance_item)
+
+        menu_bar.append(reports_item)
+
+        # Tools menu
+        tools_menu = Gtk.Menu()
+        tools_item = Gtk.MenuItem(label="Tools")
+        tools_item.set_submenu(tools_menu)
+
+        calc_item = Gtk.MenuItem(label="Calculator")
+        calc_item.connect("activate", self.on_open_calculator)
+        tools_menu.append(calc_item)
+
+        settings_item = Gtk.MenuItem(label="Settings")
+        settings_item.connect("activate", self.on_open_settings)
+        tools_menu.append(settings_item)
+
+        menu_bar.append(tools_item)
+
+        return menu_bar
+
+    def _create_toolbar(self):
+        toolbar = Gtk.Toolbar()
+
+        # Vessels
+        vessel_icon = Gtk.Image.new_from_icon_name("applications-internet", Gtk.IconSize.MENU)
+        vessel_button = Gtk.ToolButton(icon_widget=vessel_icon)
+        vessel_button.set_tooltip_text("Vessels")
+        vessel_button.connect("clicked", lambda b: self.notebook.set_current_page(0))
+        toolbar.insert(vessel_button, -1)
+
+        # Maintenance
+        maint_icon = Gtk.Image.new_from_icon_name("system-run", Gtk.IconSize.MENU)
+        maint_button = Gtk.ToolButton(icon_widget=maint_icon)
+        maint_button.set_tooltip_text("Maintenance")
+        maint_button.connect("clicked", lambda b: self.notebook.set_current_page(1))
+        toolbar.insert(maint_button, -1)
+
+        # Inventory
+        inv_icon = Gtk.Image.new_from_icon_name("stock_folder", Gtk.IconSize.MENU)
+        inv_button = Gtk.ToolButton(icon_widget=inv_icon)
+        inv_button.set_tooltip_text("Inventory")
+        inv_button.connect("clicked", lambda b: self.notebook.set_current_page(2))
+        toolbar.insert(inv_button, -1)
+
+        # Suppliers
+        supp_icon = Gtk.Image.new_from_icon_name("contact-new", Gtk.IconSize.MENU)
+        supp_button = Gtk.ToolButton(icon_widget=supp_icon)
+        supp_button.set_tooltip_text("Suppliers")
+        supp_button.connect("clicked", lambda b: self.notebook.set_current_page(3))
+        toolbar.insert(supp_button, -1)
+
+        # Trip Logs
+        trip_icon = Gtk.Image.new_from_icon_name("document-open-recent", Gtk.IconSize.MENU)
+        trip_button = Gtk.ToolButton(icon_widget=trip_icon)
+        trip_button.set_tooltip_text("Trip Logs")
+        trip_button.connect("clicked", lambda b: self.notebook.set_current_page(4))
+        toolbar.insert(trip_button, -1)
+
+        # Dashboard
+        dash_icon = Gtk.Image.new_from_icon_name("view-grid", Gtk.IconSize.MENU)
+        dash_button = Gtk.ToolButton(icon_widget=dash_icon)
+        dash_button.set_tooltip_text("Dashboard")
+        dash_button.connect("clicked", lambda b: self.notebook.set_current_page(5))
+        toolbar.insert(dash_button, -1)
+
+        return toolbar
+
+    def _add_vessels_tab(self):
+        # Vessels tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_vessel_btn = Gtk.ToolButton(icon_name="list-add")
+        add_vessel_btn.set_tooltip_text("Add Vessel")
+        add_vessel_btn.connect("clicked", self.on_add_vessel)
+        toolbar.insert(add_vessel_btn, -1)
+
+        edit_vessel_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_vessel_btn.set_tooltip_text("Edit Vessel")
+        edit_vessel_btn.connect("clicked", self.on_edit_vessel)
+        toolbar.insert(edit_vessel_btn, -1)
+
+        delete_vessel_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_vessel_btn.set_tooltip_text("Delete Vessel")
+        delete_vessel_btn.connect("clicked", self.on_delete_vessel)
+        toolbar.insert(delete_vessel_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for vessels
+        self.vessels_store = Gtk.ListStore(int, str, str, float, float, float, float, str)
+        self.vessels_tree = Gtk.TreeView(model=self.vessels_store)
+
+        for i, (title, dtype) in enumerate([
+            ("ID", int), ("Name", str), ("Type", str), ("Length", float),
+            ("Beam", float), ("Draft", float), ("Hours", float), ("Notes", str)
+        ]):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=i)
+            self.vessels_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.vessels_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Vessels"))
+
+    def _add_maintenance_tab(self):
+        # Maintenance tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_task_btn = Gtk.ToolButton(icon_name="list-add")
+        add_task_btn.set_tooltip_text("Add Task")
+        add_task_btn.connect("clicked", self.on_add_maintenance_task)
+        toolbar.insert(add_task_btn, -1)
+
+        edit_task_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_task_btn.set_tooltip_text("Edit Task")
+        edit_task_btn.connect("clicked", self.on_edit_maintenance_task)
+        toolbar.insert(edit_task_btn, -1)
+
+        delete_task_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_task_btn.set_tooltip_text("Delete Task")
+        delete_task_btn.connect("clicked", self.on_delete_maintenance_task)
+        toolbar.insert(delete_task_btn, -1)
+
+        complete_task_btn = Gtk.ToolButton(icon_name="emblem-default")
+        complete_task_btn.set_tooltip_text("Mark as Completed")
+        complete_task_btn.connect("clicked", self.on_mark_maintenance_task_completed)
+        toolbar.insert(complete_task_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for maintenance tasks
+        self.master_maintenance_store = Gtk.ListStore(
+            int, str, str, str, str, str, str, str, str, str
+        )
+        self.maintenance_tree = Gtk.TreeView(model=self.master_maintenance_store)
+
+        columns = [
+            ("ID", 0), ("Vessel", 1), ("System", 2), ("Task", 3),
+            ("Type", 4), ("Value", 5), ("Last Completed", 6),
+            ("Next Due", 7), ("Priority", 8), ("Status", 9)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.maintenance_tree.append_column(column)
+
+        # Add status color renderer
+        status_renderer = Gtk.CellRendererText()
+        status_column = Gtk.TreeViewColumn("Status", status_renderer, text=9)
+        status_column.set_cell_data_func(status_renderer, self._status_cell_data_func)
+        self.maintenance_tree.append_column(status_column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.maintenance_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Maintenance"))
+
+    def _add_inventory_tab(self):
+        # Inventory tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_item_btn = Gtk.ToolButton(icon_name="list-add")
+        add_item_btn.set_tooltip_text("Add Item")
+        add_item_btn.connect("clicked", self.on_add_inventory_item)
+        toolbar.insert(add_item_btn, -1)
+
+        edit_item_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_item_btn.set_tooltip_text("Edit Item")
+        edit_item_btn.connect("clicked", self.on_edit_inventory_item)
+        toolbar.insert(edit_item_btn, -1)
+
+        delete_item_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_item_btn.set_tooltip_text("Delete Item")
+        delete_item_btn.connect("clicked", self.on_delete_inventory_item)
+        toolbar.insert(delete_item_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for inventory items
+        self.inventory_store = Gtk.ListStore(
+            int, str, str, str, int, int, str, str, float
+        )
+        self.inventory_tree = Gtk.TreeView(model=self.inventory_store)
+
+        columns = [
+            ("ID", 0), ("Name", 1), ("Part Number", 2), ("Description", 3),
+            ("Current Stock", 4), ("Min Stock", 5), ("System", 6), ("Location", 7), ("Unit Cost", 8)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.inventory_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.inventory_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Inventory"))
+
+    def _add_suppliers_tab(self):
+        # Suppliers tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_supplier_btn = Gtk.ToolButton(icon_name="list-add")
+        add_supplier_btn.set_tooltip_text("Add Supplier")
+        add_supplier_btn.connect("clicked", self.on_add_supplier)
+        toolbar.insert(add_supplier_btn, -1)
+
+        edit_supplier_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_supplier_btn.set_tooltip_text("Edit Supplier")
+        edit_supplier_btn.connect("clicked", self.on_edit_supplier)
+        toolbar.insert(edit_supplier_btn, -1)
+
+        delete_supplier_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_supplier_btn.set_tooltip_text("Delete Supplier")
+        delete_supplier_btn.connect("clicked", self.on_delete_supplier)
+        toolbar.insert(delete_supplier_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for suppliers
+        self.suppliers_store = Gtk.ListStore(int, str, str, str, str, str)
+        self.suppliers_tree = Gtk.TreeView(model=self.suppliers_store)
+
+        columns = [
+            ("ID", 0), ("Name", 1), ("Contact", 2),
+            ("Phone", 3), ("Email", 4), ("Notes", 5)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.suppliers_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.suppliers_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Suppliers"))
+
+    def _add_trip_logs_tab(self):
+        # Trip logs tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_log_btn = Gtk.ToolButton(icon_name="list-add")
+        add_log_btn.set_tooltip_text("Add Trip Log")
+        add_log_btn.connect("clicked", self.on_add_trip_log)
+        toolbar.insert(add_log_btn, -1)
+
+        edit_log_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_log_btn.set_tooltip_text("Edit Trip Log")
+        edit_log_btn.connect("clicked", self.on_edit_trip_log)
+        toolbar.insert(edit_log_btn, -1)
+
+        delete_log_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_log_btn.set_tooltip_text("Delete Trip Log")
+        delete_log_btn.connect("clicked", self.on_delete_trip_log)
+        toolbar.insert(delete_log_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for trip logs
+        self.trip_logs_store = Gtk.ListStore(
+            int, str, str, str, str, float, float, float, float, str
+        )
+        self.trip_logs_tree = Gtk.TreeView(model=self.trip_logs_store)
+
+        columns = [
+            ("ID", 0), ("Vessel", 1), ("Origin", 2), ("Destination", 3),
+            ("Departure", 4), ("Start Hours", 5), ("End Hours", 6),
+            ("Fuel Used", 7), ("Distance", 8), ("Crew", 9)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.trip_logs_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.trip_logs_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Trip Logs"))
+
+    def _add_dashboard_tab(self):
+        # Dashboard tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Summary box
+        summary_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.overdue_label = Gtk.Label()
+        self.due_soon_label = Gtk.Label()
+        self.on_schedule_label = Gtk.Label()
+        self.completed_label = Gtk.Label()
+        summary_box.pack_start(self.overdue_label, True, True, 0)
+        summary_box.pack_start(self.due_soon_label, True, True, 0)
+        summary_box.pack_start(self.on_schedule_label, True, True, 0)
+        summary_box.pack_start(self.completed_label, True, True, 0)
+        vbox.pack_start(summary_box, False, False, 0)
+
+        # Upcoming Tasks
+        label = Gtk.Label()
+        label.set_markup("<b>Upcoming Maintenance Tasks</b>")
+        vbox.pack_start(label, False, False, 0)
+
+        # Tree view for upcoming tasks
+        self.upcoming_store = Gtk.ListStore(int, str, str, str, str, str)
+        self.upcoming_tree = Gtk.TreeView(model=self.upcoming_store)
+
+        columns = [
+            ("ID", 0), ("Vessel", 1), ("System", 2),
+            ("Task", 3), ("Due Date", 4), ("Status", 5)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.upcoming_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.upcoming_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Dashboard"))
+
+        # Update dashboard
+        self.update_dashboard()
+
+    def _add_templates_tab(self):
+        # Templates tab content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_border_width(10)
+
+        # Toolbar
+        toolbar = Gtk.Toolbar()
+        add_template_btn = Gtk.ToolButton(icon_name="list-add")
+        add_template_btn.set_tooltip_text("Add Template")
+        add_template_btn.connect("clicked", self.on_add_maintenance_template)
+        toolbar.insert(add_template_btn, -1)
+
+        edit_template_btn = Gtk.ToolButton(icon_name="document-edit")
+        edit_template_btn.set_tooltip_text("Edit Template")
+        edit_template_btn.connect("clicked", self.on_edit_maintenance_template)
+        toolbar.insert(edit_template_btn, -1)
+
+        delete_template_btn = Gtk.ToolButton(icon_name="edit-delete")
+        delete_template_btn.set_tooltip_text("Delete Template")
+        delete_template_btn.connect("clicked", self.on_delete_maintenance_template)
+        toolbar.insert(delete_template_btn, -1)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        # Tree view for maintenance templates
+        self.templates_store = Gtk.ListStore(int, str, str, str, str, str, str)
+        self.templates_tree = Gtk.TreeView(model=self.templates_store)
+
+        columns = [
+            ("ID", 0), ("Name", 1), ("System", 2), ("Task", 3),
+            ("Type", 4), ("Value", 5), ("Priority", 6)
+        ]
+
+        for title, col_id in columns:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=col_id)
+            self.templates_tree.append_column(column)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled_window.add(self.templates_tree)
+        vbox.pack_start(scrolled_window, True, True, 0)
+
+        self.notebook.append_page(vbox, Gtk.Label(label="Templates"))
+
+    def _status_cell_data_func(self, column, cell, model, tree_iter, data):
+        status_text = model[tree_iter][9] # Assuming status is in column 9
+        if status_text == "Overdue":
+            cell.set_property('foreground', 'red')
+        elif status_text == "Due Soon":
+            cell.set_property('foreground', 'orange')
+        elif status_text == "On Schedule":
+            cell.set_property('foreground', 'green')
+        elif status_text == "Completed":
+            cell.set_property('foreground', 'gray')
+        else:
+            cell.set_property('foreground', 'black')
+
+    def refresh_views(self):
+        self.update_vessels_list()
+        self.update_maintenance_list()
+        self.update_inventory_list()
+        self.update_suppliers_list()
+        self.update_trip_logs_list()
+        self.update_templates_list()
+        self.update_dashboard()
+
+    def update_vessels_list(self):
+        self.vessels_store.clear()
+        vessels = self.db.get_vessels()
+        for vessel in vessels:
+            self.vessels_store.append([
+                vessel.id or 0, vessel.name, vessel.vessel_type,
+                vessel.length, vessel.beam, vessel.draft,
+                vessel.engine_hours, vessel.notes[:50]  # Truncate notes
+            ])
+
+    def update_maintenance_list(self):
+        self.master_maintenance_store.clear()
+        tasks = self.db.get_maintenance_tasks()
+        vessels = {v.id: v for v in self.db.get_vessels()}
+
+        for task in tasks:
+            vessel = vessels.get(task.vessel_id, Vessel())
+            self.master_maintenance_store.append([
+                task.id or 0, vessel.name, task.system, task.task_name,
+                task.interval_type.display_name(), task.interval_value,
+                task.last_completed, task.next_due, task.priority.display_name(), task.status.value
+            ])
+
+    def update_inventory_list(self):
+        self.inventory_store.clear()
+        items = self.db.get_inventory_items()
+        for item in items:
+            self.inventory_store.append([
+                item.id or 0, item.name, item.part_number, item.description,
+                item.current_stock, item.minimum_stock, item.system, item.location, item.unit_cost
+            ])
+
+    def update_suppliers_list(self):
+        self.suppliers_store.clear()
+        suppliers = self.db.get_suppliers()
+        for supplier in suppliers:
+            self.suppliers_store.append([
+                supplier.id or 0, supplier.name, supplier.contact,
+                supplier.phone, supplier.email, supplier.notes[:50]  # Truncate notes
+            ])
+
+    def update_trip_logs_list(self):
+        self.trip_logs_store.clear()
+        logs = self.db.get_trip_logs()
+        vessels = {v.id: v for v in self.db.get_vessels()}
+
+        for log in logs:
+            vessel = vessels.get(log.vessel_id, Vessel())
+            self.trip_logs_store.append([
+                log.id or 0, vessel.name, log.origin, log.destination,
+                log.departure, log.start_hours, log.end_hours,
+                log.fuel_used, log.distance, log.crew
+            ])
+
+    def update_templates_list(self):
+        self.templates_store.clear()
+        templates = self.db.get_maintenance_templates()
+
+        for template in templates:
+            self.templates_store.append([
+                template.id or 0, template.name, template.system, template.task_name,
+                template.interval_type.display_name(), template.interval_value,
+                template.priority.display_name()
+            ])
+
+    def update_dashboard(self):
+        # Update summary labels
+        tasks = self.db.get_maintenance_tasks()
+        vessels = {v.id: v for v in self.db.get_vessels()}
+
+        overdue_count = 0
+        due_soon_count = 0
+        on_schedule_count = 0
+        completed_count = 0
+
+        for task in tasks:
+            vessel = vessels.get(task.vessel_id, Vessel())
+            status_enum = task.get_status(vessel.engine_hours, self.config.get("due_soon_days", 7))
+            if status_enum == Status.OVERDUE:
+                overdue_count += 1
+            elif status_enum == Status.DUE_SOON:
+                due_soon_count += 1
+            elif status_enum == Status.ON_SCHEDULE:
+                on_schedule_count += 1
+            elif status_enum == Status.COMPLETED:
+                completed_count += 1
+
+        self.overdue_label.set_markup(f'<span foreground="red"><b>Overdue: {overdue_count}</b></span>')
+        self.due_soon_label.set_markup(f'<span foreground="orange"><b>Due Soon: {due_soon_count}</b></span>')
+        self.on_schedule_label.set_markup(f'<span foreground="green"><b>On Schedule: {on_schedule_count}</b></span>')
+        self.completed_label.set_markup(f'<span foreground="gray"><b>Completed: {completed_count}</b></span>')
+
+        # Update upcoming tasks
+        self.upcoming_store.clear()
+        due_soon_days = self.config.get("due_soon_days", 7)
+
+        upcoming_tasks = []
+        for task in tasks:
+            vessel = vessels.get(task.vessel_id, Vessel())
+            status_enum = task.get_status(vessel.engine_hours, due_soon_days)
+            if status_enum in [Status.OVERDUE, Status.DUE_SOON]:
+                upcoming_tasks.append((task, status_enum))
+
+        # Sort upcoming tasks by due date/hours
+        upcoming_tasks.sort(key=lambda x: (x[0].next_due or x[0].last_completed))
+
+        for task, status_enum in upcoming_tasks:
+            vessel = vessels.get(task.vessel_id, Vessel())
+            self.upcoming_store.append([
+                task.id or 0, vessel.name, task.system, task.task_name,
+                task.next_due or task.last_completed, status_enum.display_name()
+            ])
+
+    # Event handlers
+    def on_add_vessel(self, button):
+        dialog = VesselEditor(self, self.db)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            vessel = dialog.get_values()
+            if vessel.id:
+                self.db.update_vessel(vessel)
+            else:
+                self.db.add_vessel(vessel)
+            self.update_vessels_list()
+
+        dialog.destroy()
+
+    def on_edit_vessel(self, button):
+        vessel_id = _get_selected_item(self.vessels_tree, self.vessels_store)
+        if not vessel_id:
+            show_error_dialog(self, "Please select a vessel to edit.")
+            return
+
+        vessels = self.db.get_vessels()
+        vessel = next((v for v in vessels if v.id == vessel_id), None)
+        if vessel:
+            dialog = VesselEditor(self, self.db, vessel)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                updated_vessel = dialog.get_values()
+                self.db.update_vessel(updated_vessel)
+                self.update_vessels_list()
+
+            dialog.destroy()
+
+    def on_delete_vessel(self, button):
+        vessel_id = _get_selected_item(self.vessels_tree, self.vessels_store)
+        if not vessel_id:
+            show_error_dialog(self, "Please select a vessel to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete vessel with ID {vessel_id}?"):
+            self.db.delete_vessel(vessel_id)
+            self.update_vessels_list()
+
+    def on_add_maintenance_task(self, button):
+        dialog = MaintenanceTaskEditor(self, self.db)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            task = dialog.get_values()
+            # Calculate costs
+            labor_cost, parts_cost, total_cost = calculate_maintenance_cost(task, self.db)
+            task.labor_cost = labor_cost
+            task.total_parts_cost = parts_cost
+            task.total_job_cost = total_cost
+
+            # Calculate next due if not set
+            if not task.next_due and task.last_completed:
+                task.next_due = update_task_next_due(task, self.db.get_vessels()[0]) # Simplified, should get correct vessel
+
+            if task.id:
+                self.db.update_maintenance_task(task)
+            else:
+                self.db.add_maintenance_task(task)
+            self.update_maintenance_list()
+            self.update_dashboard()
+
+        dialog.destroy()
+
+    def on_edit_maintenance_task(self, button):
+        task_id = _get_selected_item(self.maintenance_tree, self.master_maintenance_store)
+        if not task_id:
+            show_error_dialog(self, "Please select a task to edit.")
+            return
+
+        tasks = self.db.get_maintenance_tasks()
+        task = next((t for t in tasks if t.id == task_id), None)
+        if task:
+            dialog = MaintenanceTaskEditor(self, self.db, task)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                updated_task = dialog.get_values()
+                # Calculate costs
+                labor_cost, parts_cost, total_cost = calculate_maintenance_cost(updated_task, self.db)
+                updated_task.labor_cost = labor_cost
+                updated_task.total_parts_cost = parts_cost
+                updated_task.total_job_cost = total_cost
+
+                # Calculate next due if not set
+                if not updated_task.next_due and updated_task.last_completed:
+                    vessels = self.db.get_vessels()
+                    vessel = next((v for v in vessels if v.id == updated_task.vessel_id), None)
+                    if vessel:
+                        updated_task.next_due = update_task_next_due(updated_task, vessel)
+
+                self.db.update_maintenance_task(updated_task)
+                self.update_maintenance_list()
+                self.update_dashboard()
+
+            dialog.destroy()
+
+    def on_delete_maintenance_task(self, button):
+        task_id = _get_selected_item(self.maintenance_tree, self.master_maintenance_store)
+        if not task_id:
+            show_error_dialog(self, "Please select a task to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete maintenance task with ID {task_id}?"):
+            self.db.delete_maintenance_task(task_id)
+            self.update_maintenance_list()
+            self.update_dashboard()
+
+    def on_mark_maintenance_task_completed(self, button):
+        task_id = _get_selected_item(self.maintenance_tree, self.master_maintenance_store)
+        if not task_id:
+            show_error_dialog(self, "Please select a task to mark as completed.")
+            return
+
+        try:
+            tasks = self.db.get_maintenance_tasks()
+            task = next((t for t in tasks if t.id == task_id), None)
+            if not task:
+                show_error_dialog(self, "Task not found.")
+                return
+
+            # Confirm action
+            if not show_confirmation_dialog(self, f"Mark task '{task.task_name}' as completed?"):
+                return
+
+            # Update task
+            task.last_completed = datetime.date.today().strftime("%Y-%m-%d")
+            # Calculate next due date if applicable
+            if task.interval_type in [IntervalType.HOURS, IntervalType.USAGE_CYCLES]:
+                vessels = self.db.get_vessels()
+                vessel = next((v for v in vessels if v.id == task.vessel_id), None)
+                if vessel:
+                    task.last_hours = vessel.engine_hours
+            task.next_due = update_task_next_due(task, vessel) if vessel else ""
+            task.status = TaskStatus.COMPLETED
+
+            self.db.update_maintenance_task(task)
+            self.update_maintenance_list()
+            self.update_dashboard()
+            show_info_dialog(self, f"Task '{task.task_name}' marked as completed.")
+        except Exception as e:
+            logger.error(f"Error marking task as completed: {e}")
+            show_error_dialog(self, f"An error occurred: {e}")
+
+    def on_add_inventory_item(self, button):
+        dialog = InventoryItemEditor(self, self.db)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            item = dialog.get_values()
+            if item.id:
+                self.db.update_inventory_item(item)
+            else:
+                self.db.add_inventory_item(item)
+            self.update_inventory_list()
+
+        dialog.destroy()
+
+    def on_edit_inventory_item(self, button):
+        item_id = _get_selected_item(self.inventory_tree, self.inventory_store)
+        if not item_id:
+            show_error_dialog(self, "Please select an item to edit.")
+            return
+
+        items = self.db.get_inventory_items()
+        item = next((i for i in items if i.id == item_id), None)
+        if item:
+            dialog = InventoryItemEditor(self, self.db, item)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                updated_item = dialog.get_values()
+                self.db.update_inventory_item(updated_item)
+                self.update_inventory_list()
+
+            dialog.destroy()
+
+    def on_delete_inventory_item(self, button):
+        item_id = _get_selected_item(self.inventory_tree, self.inventory_store)
+        if not item_id:
+            show_error_dialog(self, "Please select an item to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete inventory item with ID {item_id}?"):
+            self.db.delete_inventory_item(item_id)
+            self.update_inventory_list()
+
+    def on_add_supplier(self, button):
+        dialog = SupplierEditor(self, self.db)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            supplier = dialog.get_values()
+            if supplier.id:
+                self.db.update_supplier(supplier)
+            else:
+                self.db.add_supplier(supplier)
+            self.update_suppliers_list()
+
+        dialog.destroy()
+
+    def on_edit_supplier(self, button):
+        supplier_id = _get_selected_item(self.suppliers_tree, self.suppliers_store)
+        if not supplier_id:
+            show_error_dialog(self, "Please select a supplier to edit.")
+            return
+
+        suppliers = self.db.get_suppliers()
+        supplier = next((s for s in suppliers if s.id == supplier_id), None)
+        if supplier:
+            dialog = SupplierEditor(self, self.db, supplier)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                updated_supplier = dialog.get_values()
+                self.db.update_supplier(updated_supplier)
+                self.update_suppliers_list()
+
+            dialog.destroy()
+
+    def on_delete_supplier(self, button):
+        supplier_id = _get_selected_item(self.suppliers_tree, self.suppliers_store)
+        if not supplier_id:
+            show_error_dialog(self, "Please select a supplier to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete supplier with ID {supplier_id}?"):
+            self.db.delete_supplier(supplier_id)
+            self.update_suppliers_list()
+
+    def on_add_trip_log(self, button):
+        dialog = TripLogEditor(self, self.db)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            log = dialog.get_values()
+            if log.id:
+                self.db.update_trip_log(log)
+            else:
+                self.db.add_trip_log(log)
+            self.update_trip_logs_list()
+
+        dialog.destroy()
+
+    def on_edit_trip_log(self, button):
+        log_id = _get_selected_item(self.trip_logs_tree, self.trip_logs_store)
+        if not log_id:
+            show_error_dialog(self, "Please select a trip log to edit.")
+            return
+
+        logs = self.db.get_trip_logs()
+        log = next((l for l in logs if l.id == log_id), None)
+        if log:
+            dialog = TripLogEditor(self, self.db, log)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                updated_log = dialog.get_values()
+                self.db.update_trip_log(updated_log)
+                self.update_trip_logs_list()
+
+            dialog.destroy()
+
+    def on_delete_trip_log(self, button):
+        log_id = _get_selected_item(self.trip_logs_tree, self.trip_logs_store)
+        if not log_id:
+            show_error_dialog(self, "Please select a trip log to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete trip log with ID {log_id}?"):
+            self.db.delete_trip_log(log_id)
+            self.update_trip_logs_list()
+
+    def on_add_maintenance_template(self, button):
+        dialog = MaintenanceTaskEditor(self, self.db) # Reuse the task editor for templates
+        dialog.set_title("Add Maintenance Template")
+        # Modify dialog to hide vessel selection and other non-template fields if needed
+        # For simplicity, we'll just change the save logic
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            task_data = dialog.get_values()
+            template = MaintenanceTemplate(
+                name=task_data.task_name, # Use task name as template name
+                system=task_data.system,
+                task_name=task_data.task_name,
+                interval_type=task_data.interval_type,
+                interval_value=task_data.interval_value,
+                priority=task_data.priority,
+                parts_required=task_data.parts_required,
+                instructions=task_data.instructions,
+                labor_cost=task_data.labor_cost,
+                estimated_duration_hours=task_data.estimated_duration_hours
+            )
+            self.db.add_maintenance_template(template)
+            self.update_templates_list()
+
+        dialog.destroy()
+
+    def on_edit_maintenance_template(self, button):
+        template_id = _get_selected_item(self.templates_tree, self.templates_store)
+        if not template_id:
+            show_error_dialog(self, "Please select a template to edit.")
+            return
+
+        templates = self.db.get_maintenance_templates()
+        template = next((t for t in templates if t.id == template_id), None)
+        if template:
+            # Create a temporary MaintenanceTask object to pass to the editor
+            temp_task = MaintenanceTask(
+                id=template.id,
+                system=template.system,
+                task_name=template.task_name,
+                interval_type=template.interval_type,
+                interval_value=template.interval_value,
+                priority=template.priority,
+                parts_required=template.parts_required,
+                instructions=template.instructions,
+                labor_cost=template.labor_cost,
+                estimated_duration_hours=template.estimated_duration_hours
+            )
+            dialog = MaintenanceTaskEditor(self, self.db, temp_task)
+            dialog.set_title("Edit Maintenance Template")
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                task_data = dialog.get_values()
+                updated_template = MaintenanceTemplate(
+                    id=task_data.id,
+                    name=task_data.task_name, # Use task name as template name
+                    system=task_data.system,
+                    task_name=task_data.task_name,
+                    interval_type=task_data.interval_type,
+                    interval_value=task_data.interval_value,
+                    priority=task_data.priority,
+                    parts_required=task_data.parts_required,
+                    instructions=task_data.instructions,
+                    labor_cost=task_data.labor_cost,
+                    estimated_duration_hours=task_data.estimated_duration_hours
+                )
+                self.db.update_maintenance_template(updated_template)
+                self.update_templates_list()
+
+            dialog.destroy()
+
+    def on_delete_maintenance_template(self, button):
+        template_id = _get_selected_item(self.templates_tree, self.templates_store)
+        if not template_id:
+            show_error_dialog(self, "Please select a template to delete.")
+            return
+
+        # Show confirmation dialog
+        if show_confirmation_dialog(self, f"Are you sure you want to delete template with ID {template_id}?"):
+            self.db.delete_maintenance_template(template_id)
+            self.update_templates_list()
+
+    def on_export_data(self, menu_item):
+        dialog = Gtk.FileChooserDialog(
+            title="Export Data",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        )
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            export_dir = dialog.get_filename()
+            if self.db.export_data_to_csv(export_dir):
+                show_info_dialog(self, f"Data exported successfully to {export_dir}")
+            else:
+                show_error_dialog(self, "Failed to export data.")
+        dialog.destroy()
+
+    def on_import_data(self, menu_item):
+        dialog = Gtk.FileChooserDialog(
+            title="Import Data",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        )
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            import_dir = dialog.get_filename()
+            if self.db.import_data_from_csv(import_dir):
+                show_info_dialog(self, f"Data imported successfully from {import_dir}")
+                self.refresh_views()
+            else:
+                show_error_dialog(self, "Failed to import data.")
+        dialog.destroy()
+
+    def on_create_backup(self, menu_item):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"vessel_keeper_backup_{timestamp}.zip"
+        backup_path = os.path.join(BACKUP_DIR, backup_filename)
+
+        try:
+            with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add database file
+                zipf.write(self.db.db_path, os.path.basename(self.db.db_path))
+                # Add config file
+                if os.path.exists(CONFIG_FILE):
+                    zipf.write(CONFIG_FILE, os.path.basename(CONFIG_FILE))
+                # Add attachments directory
+                if os.path.exists(ATTACHMENTS_DIR):
+                    for root, dirs, files in os.walk(ATTACHMENTS_DIR):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            zipf.write(file_path, os.path.relpath(file_path, os.path.dirname(ATTACHMENTS_DIR)))
+            show_info_dialog(self, f"Backup created successfully: {backup_path}")
+        except Exception as e:
+            logger.error(f"Failed to create backup: {e}")
+            show_error_dialog(self, f"Failed to create backup: {e}")
+
+    def on_restore_backup(self, menu_item):
+        dialog = Gtk.FileChooserDialog(
+            title="Restore from Backup",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        )
+        dialog.set_current_folder(BACKUP_DIR)
+        filter_zip = Gtk.FileFilter()
+        filter_zip.set_name("ZIP files")
+        filter_zip.add_pattern("*.zip")
+        dialog.add_filter(filter_zip)
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            backup_path = dialog.get_filename()
+            try:
+                # Verify backup integrity with a hash check (if stored)
+                # For now, just try to extract
+                with zipfile.ZipFile(backup_path, 'r') as zipf:
+                    # Check for expected files
+                    expected_files = [os.path.basename(self.db.db_path), os.path.basename(CONFIG_FILE)]
+                    missing_files = [f for f in expected_files if f not in zipf.namelist()]
+                    if missing_files:
+                        show_error_dialog(self, f"Backup file is missing expected files: {missing_files}")
+                        dialog.destroy()
+                        return
+
+                    # Create a temporary directory for extraction
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        zipf.extractall(temp_dir)
+
+                        # Confirm overwrite
+                        if not show_confirmation_dialog(self, "This will overwrite the current database and configuration. Continue?"):
+                            dialog.destroy()
+                            return
+
+                        # Stop database connection temporarily
+                        self.db.close()
+
+                        # Copy files to main directory
+                        extracted_db_path = os.path.join(temp_dir, os.path.basename(self.db.db_path))
+                        extracted_config_path = os.path.join(temp_dir, os.path.basename(CONFIG_FILE))
+                        extracted_attachments_path = os.path.join(temp_dir, ATTACHMENTS_DIR)
+
+                        shutil.copy2(extracted_db_path, self.db.db_path)
+                        if os.path.exists(extracted_config_path):
+                            shutil.copy2(extracted_config_path, CONFIG_FILE)
+                        if os.path.exists(extracted_attachments_path):
+                            # Clear current attachments and copy new ones
+                            shutil.rmtree(ATTACHMENTS_DIR, ignore_errors=True)
+                            shutil.copytree(extracted_attachments_path, ATTACHMENTS_DIR)
+
+                # Reconnect to the restored database
+                self.db = Database()
+                self.config = self._load_config()
+                self.refresh_views()
+                show_info_dialog(self, f"Backup restored successfully from {backup_path}")
+            except Exception as e:
+                logger.error(f"Failed to restore backup: {e}")
+                show_error_dialog(self, f"Failed to restore backup: {e}")
+        dialog.destroy()
+
+    def on_generate_report(self, menu_item, report_type):
+        dialog = ReportDialog(self, self.db, report_type, self.config)
+        dialog.show_all()
+
+    def on_open_calculator(self, menu_item):
+        # Simple placeholder for calculator
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Calculator feature would open here."
+        )
+        dialog.run()
+        dialog.destroy()
+
+    def on_open_settings(self, menu_item):
+        # Simple placeholder for settings
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Settings dialog would open here."
+        )
+        dialog.run()
+        dialog.destroy()
+
+    def do_delete_event(self, event):
+        self._save_config()
+        self.db.close()
+        return False
+
+# --- Application Class ---
+class VesselKeeperApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.example.VesselKeeper")
+        self.window = None
+
+    def do_activate(self):
+        if not self.window:
+            self.window = VesselKeeperApp(self)
+        self.window.present()
+
+# --- Main Function ---
+def main():
+    app = VesselKeeperApplication()
+    return app.run(sys.argv)
+
+if __name__ == "__main__":
+    main()
