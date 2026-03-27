@@ -5,9 +5,6 @@ Vessel Keeper - Complete Enterprise Marine Vessel Management System
 """
 
 import gi
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, Gio, GLib, Pango
-
 import sys
 import os
 import sqlite3
@@ -17,13 +14,26 @@ import datetime
 import time
 import csv
 import shutil
+import threading
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from contextlib import contextmanager
 from queue import Queue, Empty
 
+# Robust GTK Check
+try:
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, Gio, GLib, Pango
+except ValueError:
+    print("\n=== GTK 3 NOT FOUND ===\n")
+    print("Please install the required packages:")
+    print("   sudo apt update")
+    print("   sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-pango-1.0")
+    print("\nAfter installing, run the app again.")
+    sys.exit(1)
+
 # =============================================================================
-# LOGGING
+# STRUCTURED LOGGING
 # =============================================================================
 class StructuredLogger:
     def __init__(self):
@@ -48,7 +58,7 @@ class StructuredLogger:
 logger = StructuredLogger()
 
 # =============================================================================
-# CONFIG
+# CONFIG MANAGER
 # =============================================================================
 class AppConfig:
     def __init__(self):
@@ -94,7 +104,7 @@ class ConfigManager:
             return getattr(self._config, key, default)
 
 # =============================================================================
-# DATABASE
+# DATABASE LAYER
 # =============================================================================
 class DatabaseConnectionPool:
     def __init__(self, db_path="vessel_keeper.db", max_conn=6):
@@ -175,12 +185,17 @@ class ThreadSafeDatabase:
         with self.pool.get_connection() as conn:
             return conn.execute(sql, params).rowcount
 
-    def get_vessels(self): return self.execute_query("SELECT * FROM vessels ORDER BY name")
-    def get_inventory(self): return self.execute_query("SELECT * FROM inventory_items ORDER BY name")
+    def get_vessels(self): 
+        return self.execute_query("SELECT * FROM vessels ORDER BY name")
+
+    def get_inventory(self): 
+        return self.execute_query("SELECT * FROM inventory_items ORDER BY name")
+
     def get_maintenance_tasks(self):
         return self.execute_query("""
             SELECT mt.*, COALESCE(v.name, 'Unknown Vessel') as vessel_name 
-            FROM maintenance_tasks mt LEFT JOIN vessels v ON mt.vessel_id = v.id 
+            FROM maintenance_tasks mt 
+            LEFT JOIN vessels v ON mt.vessel_id = v.id 
             ORDER BY mt.next_due
         """)
 
@@ -192,7 +207,7 @@ class ThreadSafeDatabase:
                 pass
 
 # =============================================================================
-# UI MANAGER
+# UI STATE MANAGER
 # =============================================================================
 class UIStateManager:
     def __init__(self):
@@ -215,7 +230,7 @@ class UIStateManager:
             return False
 
 # =============================================================================
-# MAIN APPLICATION - COMPLETE
+# MAIN APPLICATION
 # =============================================================================
 class VesselKeeperApp(Gtk.Window):
     def __init__(self):
@@ -282,7 +297,7 @@ class VesselKeeperApp(Gtk.Window):
     def _create_tab(self, name: str, filter_model, base_store, columns):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, border_width=10)
 
-        # Search
+        # Search bar
         search = Gtk.SearchEntry(placeholder_text=f"Search {name}...")
         search.connect("search-changed", lambda e: self._apply_filter(filter_model, base_store, e.get_text()))
         box.pack_start(search, False, False, 0)
@@ -307,7 +322,8 @@ class VesselKeeperApp(Gtk.Window):
         for i, title in enumerate(columns):
             col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i)
             col.set_resizable(True)
-            if i == 0: col.set_visible(False)
+            if i == 0:
+                col.set_visible(False)
             tree.append_column(col)
 
         scroll = Gtk.ScrolledWindow()
@@ -319,7 +335,8 @@ class VesselKeeperApp(Gtk.Window):
 
     def _apply_filter(self, filter_model, base_store, text):
         def visible_func(model, iter_, data):
-            if not text: return True
+            if not text:
+                return True
             for i in range(model.get_n_columns()):
                 val = model.get_value(iter_, i)
                 if val and text.lower() in str(val).lower():
@@ -349,13 +366,13 @@ class VesselKeeperApp(Gtk.Window):
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = Path("backups") / f"startup_{timestamp}.db"
-            if os.path.exists("vessel_keeper.db"):
+            if Path("vessel_keeper.db").exists():
                 shutil.copy2("vessel_keeper.db", backup_path)
                 logger.info("Startup backup created", path=str(backup_path))
         except Exception as e:
             logger.warning("Startup backup failed", error=str(e))
 
-    # ====================== MAINTENANCE DIALOG ======================
+    # ====================== DIALOGS ======================
     def _create_maintenance_dialog(self, initial=None):
         dialog = Gtk.Dialog(title="Maintenance Task", transient_for=self, flags=0)
         dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
@@ -383,7 +400,7 @@ class VesselKeeperApp(Gtk.Window):
             entries[key] = entry
 
         if initial and initial.get('vessel_name'):
-            combo.set_active_text(initial['vessel_name'])
+            combo.set_active_text(initial.get('vessel_name'))
 
         response = dialog.run()
         result = None
@@ -399,14 +416,35 @@ class VesselKeeperApp(Gtk.Window):
         dialog.destroy()
         return result
 
-    # ====================== CRUD METHODS ======================
+    def _create_simple_form(self, title, fields, initial=None):
+        dialog = Gtk.Dialog(title=title, transient_for=self, flags=0)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        grid = Gtk.Grid(row_spacing=10, column_spacing=15, border_width=20)
+        dialog.get_content_area().add(grid)
+
+        entries = {}
+        initial = initial or {}
+        for i, key in enumerate(fields):
+            lbl = Gtk.Label(label=key.replace("_", " ").title() + ":")
+            entry = Gtk.Entry(text=str(initial.get(key, "")))
+            grid.attach(lbl, 0, i, 1, 1)
+            grid.attach(entry, 1, i, 1, 1)
+            entries[key] = entry
+
+        response = dialog.run()
+        result = None
+        if response == Gtk.ResponseType.OK:
+            result = {k: e.get_text().strip() for k, e in entries.items()}
+        dialog.destroy()
+        return result
+
+    # ====================== CRUD ======================
     def _add_vessel(self, btn=None):
-        # Simple form for vessel
-        dialog = self._create_simple_form("Add Vessel", ["name", "vessel_type", "engine_make", "engine_model", "current_location"])
-        if dialog and dialog.get("name"):
+        data = self._create_simple_form("Add Vessel", ["name", "vessel_type", "engine_make", "engine_model", "current_location"])
+        if data and data.get("name"):
             self.db.execute_update(
                 "INSERT INTO vessels (name, vessel_type, engine_make, engine_model, current_location) VALUES (?,?,?,?,?)",
-                (dialog["name"], dialog["vessel_type"], dialog["engine_make"], dialog["engine_model"], dialog["current_location"])
+                (data["name"], data["vessel_type"], data["engine_make"], data["engine_model"], data["current_location"])
             )
             self.refresh_all()
 
@@ -429,12 +467,12 @@ class VesselKeeperApp(Gtk.Window):
             self.refresh_all()
 
     def _add_inventory(self, btn=None):
-        dialog = self._create_simple_form("Add Inventory Item", ["name", "part_number", "category", "current_stock", "minimum_stock", "unit_cost"])
-        if dialog and dialog.get("name"):
+        data = self._create_simple_form("Add Inventory Item", ["name", "part_number", "category", "current_stock", "minimum_stock", "unit_cost"])
+        if data and data.get("name"):
             self.db.execute_update(
                 "INSERT INTO inventory_items (name, part_number, category, current_stock, minimum_stock, unit_cost) VALUES (?,?,?,?,?,?)",
-                (dialog["name"], dialog["part_number"], dialog["category"], 
-                 int(dialog.get("current_stock", 0)), int(dialog.get("minimum_stock", 0)), float(dialog.get("unit_cost", 0)))
+                (data["name"], data["part_number"], data["category"], 
+                 int(data.get("current_stock", 0)), int(data.get("minimum_stock", 0)), float(data.get("unit_cost", 0)))
             )
             self.refresh_all()
 
@@ -465,28 +503,6 @@ class VesselKeeperApp(Gtk.Window):
             self.db.execute_update("DELETE FROM maintenance_tasks WHERE id=?", (row[0],))
             self.refresh_all()
 
-    def _create_simple_form(self, title, fields, initial=None):
-        dialog = Gtk.Dialog(title=title, transient_for=self, flags=0)
-        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
-        grid = Gtk.Grid(row_spacing=10, column_spacing=15, border_width=20)
-        dialog.get_content_area().add(grid)
-
-        entries = {}
-        initial = initial or {}
-        for i, key in enumerate(fields):
-            lbl = Gtk.Label(label=key.replace("_", " ").title() + ":")
-            entry = Gtk.Entry(text=str(initial.get(key, "")))
-            grid.attach(lbl, 0, i, 1, 1)
-            grid.attach(entry, 1, i, 1, 1)
-            entries[key] = entry
-
-        response = dialog.run()
-        result = None
-        if response == Gtk.ResponseType.OK:
-            result = {k: e.get_text().strip() for k, e in entries.items()}
-        dialog.destroy()
-        return result
-
     def _get_selected(self, treeview):
         selection = treeview.get_selection()
         model, iter_ = selection.get_selected()
@@ -505,13 +521,13 @@ class VesselKeeperApp(Gtk.Window):
 
             if section == "Vessels":
                 data = self.db.get_vessels()
-                headers = ["id", "name", "vessel_type", "engine_make", "engine_model", "current_location"]
+                headers = ["id","name","vessel_type","engine_make","engine_model","current_location"]
             elif section == "Inventory":
                 data = self.db.get_inventory()
-                headers = ["id", "name", "part_number", "category", "current_stock", "minimum_stock", "unit_cost"]
+                headers = ["id","name","part_number","category","current_stock","minimum_stock","unit_cost"]
             else:
                 data = self.db.get_maintenance_tasks()
-                headers = ["id", "vessel_name", "system", "task_name", "description", "next_due", "status", "priority"]
+                headers = ["id","vessel_name","system","task_name","description","next_due","status","priority"]
 
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=headers)
@@ -529,22 +545,16 @@ class VesselKeeperApp(Gtk.Window):
         self.ui_manager.queue_action(self._update_all_views, vessels, inventory, tasks)
 
     def _update_all_views(self, vessels, inventory, tasks):
-        today = datetime.date.today()
-        due_soon_days = self.config.get("due_soon_days", 7)
-
-        # Vessels
         self.vessels_store.clear()
         for v in vessels:
-            self.vessels_store.append([v['id'], v['name'], v.get('vessel_type',''), v.get('engine_make',''),
-                                     v.get('engine_model',''), v.get('current_location','')])
+            self.vessels_store.append([v['id'], v['name'], v.get('vessel_type',''), 
+                                     v.get('engine_make',''), v.get('engine_model',''), v.get('current_location','')])
 
-        # Inventory
         self.inventory_store.clear()
         for i in inventory:
             self.inventory_store.append([i['id'], i['name'], i.get('part_number',''), i.get('category',''),
                                        i.get('current_stock',0), i.get('minimum_stock',0), float(i.get('unit_cost',0))])
 
-        # Maintenance with color logic (applied via cell data func in real app, here simplified)
         self.tasks_store.clear()
         for t in tasks:
             self.tasks_store.append([t['id'], t.get('vessel_name',''), t.get('system',''), t.get('task_name',''),
@@ -572,7 +582,7 @@ class VesselKeeperApp(Gtk.Window):
             self.config._config.window_height = h
             self.config.save()
         except Exception as e:
-            logger.error("Shutdown error", error=str(e))
+            logger.error("Shutdown save failed", error=str(e))
 
         self.db.close()
         logger.info("Vessel Keeper shutdown complete")
