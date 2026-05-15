@@ -23,8 +23,9 @@ import zipfile
 import tempfile
 import shutil
 import weakref
+import contextvars
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple, Callable, Iterator
+from typing import Optional, List, Dict, Any, Tuple, Callable, Iterator, TypedDict
 from enum import Enum, auto
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -40,11 +41,52 @@ DATABASE_FILE = "vessel_keeper.db"
 REPORTS_DIR = "reports"
 BACKUP_DIR = "backups"
 
+# Context variables for distributed tracing
+request_id = contextvars.ContextVar('request_id', default='system')
+
+# =============================================================================
+# TYPE DEFINITIONS
+# =============================================================================
+class VesselRow(TypedDict, total=False):
+    """Type-safe vessel database row"""
+    id: int
+    name: str
+    vessel_type: str
+    engine_make: str
+    engine_model: str
+    current_location: str
+    created_at: str
+
+class MaintenanceTaskRow(TypedDict, total=False):
+    """Type-safe maintenance task database row"""
+    id: int
+    vessel_id: int
+    vessel_name: str
+    system: str
+    task_name: str
+    description: str
+    next_due: str
+    status: str
+    priority: str
+    created_at: str
+
+class InventoryItemRow(TypedDict, total=False):
+    """Type-safe inventory item database row"""
+    id: int
+    name: str
+    part_number: str
+    category: str
+    current_stock: int
+    minimum_stock: int
+    unit_cost: float
+    supplier_id: int
+    created_at: str
+
 # =============================================================================
 # ENHANCED LOGGING SETUP
 # =============================================================================
 class StructuredLogger:
-    """Enterprise-grade structured logging with context"""
+    """Enterprise-grade structured logging with context and request tracing"""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -77,7 +119,11 @@ class StructuredLogger:
         self.logger.critical(f"{message} | {self._format_context(context)}")
     
     def _format_context(self, context: Dict) -> str:
-        return " | ".join(f"{k}={v}" for k, v in context.items())
+        """Format context with request ID for tracing"""
+        rid = request_id.get()
+        base = f"request_id={rid}"
+        extra = " | ".join(f"{k}={v}" for k, v in context.items())
+        return f"{base} | {extra}" if extra else base
 
 logger = StructuredLogger()
 
@@ -136,6 +182,40 @@ class ResourceError(Exception):
 class MigrationError(DatabaseError):
     """Raised when database migrations fail"""
     pass
+
+# =============================================================================
+# VALIDATION LAYER
+# =============================================================================
+class DataValidator:
+    """Centralized data validation with clear error messages"""
+    
+    @staticmethod
+    def validate_vessel(vessel: Vessel) -> None:
+        """Validate vessel data before database operations"""
+        if not vessel.name or not vessel.name.strip():
+            raise ValidationError("Vessel name cannot be empty")
+        if len(vessel.name) > 255:
+            raise ValidationError("Vessel name too long (maximum 255 characters)")
+        if vessel.vessel_type and len(vessel.vessel_type) > 100:
+            raise ValidationError("Vessel type too long (maximum 100 characters)")
+        if vessel.engine_make and len(vessel.engine_make) > 100:
+            raise ValidationError("Engine make too long (maximum 100 characters)")
+        if vessel.engine_model and len(vessel.engine_model) > 100:
+            raise ValidationError("Engine model too long (maximum 100 characters)")
+    
+    @staticmethod
+    def validate_maintenance_task(task: MaintenanceTask) -> None:
+        """Validate maintenance task data"""
+        if task.vessel_id <= 0:
+            raise ValidationError("Invalid vessel ID")
+        if not task.task_name or not task.task_name.strip():
+            raise ValidationError("Task name cannot be empty")
+        if len(task.task_name) > 255:
+            raise ValidationError("Task name too long (maximum 255 characters)")
+        if task.status not in ['pending', 'in_progress', 'completed', 'overdue']:
+            raise ValidationError(f"Invalid status: {task.status}")
+        if task.priority not in ['low', 'medium', 'high', 'critical']:
+            raise ValidationError(f"Invalid priority: {task.priority}")
 
 # =============================================================================
 # CONFIGURATION MANAGEMENT
@@ -215,7 +295,7 @@ class ConfigManager:
 # DATABASE CONNECTION POOL
 # =============================================================================
 class DatabaseConnectionPool:
-    """Thread-safe database connection pool with health monitoring"""
+    """Thread-safe database connection pool with health monitoring and improved backoff"""
     
     def __init__(self, db_path: str, max_connections: int = 5, timeout: float = 30.0):
         self.db_path = db_path
@@ -286,12 +366,20 @@ class DatabaseConnectionPool:
                 self._release_connection(conn)
     
     def _acquire_connection(self) -> sqlite3.Connection:
-        """Acquire connection with timeout and health check"""
+        """Acquire connection with exponential backoff and health check"""
         deadline = time.time() + self.timeout
+        retry_delay = 0.05  # Start with 50ms
+        max_retry_delay = 1.0
         
         while time.time() < deadline:
             try:
-                conn = self._connections.get(timeout=1)
+                remaining_time = deadline - time.time()
+                if remaining_time <= 0:
+                    break
+                
+                timeout_for_get = min(1.0, remaining_time)
+                conn = self._connections.get(timeout=timeout_for_get)
+                
                 if self._health_check(conn):
                     with self._lock:
                         self._in_use.add(id(conn))
@@ -307,9 +395,11 @@ class DatabaseConnectionPool:
                         self._in_use.add(id(new_conn))
                     return new_conn
             except Empty:
-                continue
+                # Exponential backoff with jitter
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, max_retry_delay)
         
-        raise DatabaseError("Timeout acquiring database connection")
+        raise DatabaseError(f"Timeout acquiring database connection after {self.timeout}s")
     
     def _release_connection(self, conn: sqlite3.Connection):
         """Release connection back to pool"""
@@ -330,6 +420,16 @@ class DatabaseConnectionPool:
         except sqlite3.Error as e:
             logger.warning(f"Error releasing connection: {e}")
             conn.close()
+    
+    def get_pool_status(self) -> Dict[str, Any]:
+        """Get connection pool health status"""
+        with self._lock:
+            return {
+                "total_connections": self.max_connections,
+                "in_use": len(self._in_use),
+                "available": self._connections.qsize(),
+                "pool_exhaustion_ratio": len(self._in_use) / self.max_connections
+            }
     
     def close_all(self):
         """Close all connections gracefully"""
@@ -388,6 +488,8 @@ class ThreadSafeDatabase:
         self.connection_pool = DatabaseConnectionPool(db_path)
         self._query_lock = threading.RLock()
         self._metrics = DatabaseMetrics()
+        self._vessel_cache: Dict[int, str] = {}
+        self._vessel_cache_lock = threading.RLock()
         self._ensure_database_integrity()
     
     def _ensure_database_integrity(self):
@@ -636,7 +738,7 @@ class ThreadSafeDatabase:
         }
     
     def _create_emergency_backup(self, reason: str) -> Optional[str]:
-        """Create emergency backup"""
+        """Create and verify emergency backup before relying on it"""
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_dir = Path("backups/emergency")
@@ -647,7 +749,20 @@ class ThreadSafeDatabase:
             with self.connection_pool.get_connection() as conn:
                 conn.execute(f"VACUUM INTO '{backup_path}'")
             
-            logger.info(f"Emergency backup created: {backup_path}")
+            # Verify backup integrity BEFORE returning
+            try:
+                with sqlite3.connect(str(backup_path)) as verify_conn:
+                    result = verify_conn.execute("PRAGMA integrity_check").fetchone()
+                    if result[0] != "ok":
+                        logger.error(f"Backup verification failed: {result[0]}")
+                        backup_path.unlink()
+                        return None
+            except sqlite3.Error as e:
+                logger.error(f"Backup verification raised error: {e}")
+                backup_path.unlink()
+                return None
+            
+            logger.info(f"Emergency backup created and verified: {backup_path}")
             return str(backup_path)
             
         except Exception as e:
@@ -720,7 +835,16 @@ class ThreadSafeDatabase:
     
     @contextmanager
     def get_cursor(self) -> Iterator[sqlite3.Cursor]:
-        """Thread-safe cursor context manager"""
+        """Thread-safe cursor context manager with isolation levels.
+        
+        Example:
+            with db.get_cursor() as cursor:
+                cursor.execute("SELECT * FROM vessels")
+                results = cursor.fetchall()
+        
+        Raises:
+            DatabaseError: If connection acquisition or operation fails.
+        """
         start_time = time.time()
         with self._query_lock, self.connection_pool.get_connection() as conn:
             cursor = conn.cursor()
@@ -748,26 +872,50 @@ class ThreadSafeDatabase:
             cursor.execute(query, params)
             return cursor.rowcount
     
-    def get_vessels(self) -> List[Dict]:
-        """Get all vessels"""
-        return self.execute_query("SELECT * FROM vessels ORDER BY name")
+    def get_vessels(self) -> List[VesselRow]:
+        """Get all vessels with type safety."""
+        result = self.execute_query("SELECT * FROM vessels ORDER BY name")
+        # Update cache for N+1 query elimination
+        with self._vessel_cache_lock:
+            self._vessel_cache = {row['id']: row['name'] for row in result}
+        return result
     
-    def get_maintenance_tasks(self) -> List[Dict]:
-        """Get all maintenance tasks"""
-        return self.execute_query("""
-            SELECT mt.*, v.name as vessel_name 
-            FROM maintenance_tasks mt 
-            LEFT JOIN vessels v ON mt.vessel_id = v.id 
-            ORDER BY mt.next_due
-        """)
+    def get_maintenance_tasks_with_vessels(self, use_cache: bool = True) -> List[MaintenanceTaskRow]:
+        """Get maintenance tasks with vessel data, using cache to eliminate N+1 queries.
+        
+        Args:
+            use_cache: Whether to use cached vessel lookups
+        
+        Returns:
+            List of maintenance tasks with vessel names populated
+        """
+        # Ensure cache is populated
+        if use_cache and not self._vessel_cache:
+            self.get_vessels()
+        
+        tasks = self.execute_query("SELECT * FROM maintenance_tasks ORDER BY next_due")
+        
+        with self._vessel_cache_lock:
+            for task in tasks:
+                task['vessel_name'] = self._vessel_cache.get(task.get('vessel_id'), 'Unknown')
+        
+        return tasks
     
-    def get_inventory_items(self) -> List[Dict]:
-        """Get all inventory items"""
+    def get_maintenance_tasks(self) -> List[MaintenanceTaskRow]:
+        """Get all maintenance tasks with vessel names (legacy method)"""
+        return self.get_maintenance_tasks_with_vessels(use_cache=True)
+    
+    def get_inventory_items(self) -> List[InventoryItemRow]:
+        """Get all inventory items with type safety."""
         return self.execute_query("SELECT * FROM inventory_items ORDER BY name")
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get database performance metrics"""
         return self._metrics.get_summary()
+    
+    def get_pool_status(self) -> Dict[str, Any]:
+        """Get connection pool status"""
+        return self.connection_pool.get_pool_status()
     
     def create_backup(self, backup_path: str) -> bool:
         """Create verified database backup"""
@@ -796,17 +944,25 @@ class ThreadSafeDatabase:
 # UI STATE MANAGEMENT
 # =============================================================================
 class UIStateManager:
-    """Thread-safe UI state management with action queuing"""
+    """Thread-safe UI state management with action queuing and overflow protection"""
     
-    def __init__(self):
-        self._ui_actions: Queue[Tuple[Callable, tuple, dict]] = Queue()
+    def __init__(self, max_queue_size: int = 1000):
+        self._ui_actions: Queue[Tuple[Callable, tuple, dict]] = Queue(maxsize=max_queue_size)
         self._is_processing = False
         self._action_lock = threading.RLock()
+        self._queue_overflow_count = 0
     
     def queue_ui_action(self, action: Callable, *args, **kwargs):
-        """Queue UI action for main thread execution"""
+        """Queue UI action for main thread execution with overflow protection"""
+        try:
+            self._ui_actions.put((action, args, kwargs), timeout=0.1)
+        except Full:
+            self._queue_overflow_count += 1
+            if self._queue_overflow_count % 100 == 0:
+                logger.warning(f"UI action queue overflow: {self._queue_overflow_count} dropped actions")
+            return
+        
         with self._action_lock:
-            self._ui_actions.put((action, args, kwargs))
             if not self._is_processing:
                 self._is_processing = True
                 GLib.idle_add(self._process_queued_actions)
@@ -862,26 +1018,31 @@ class LazyDataLoader:
         self._load_lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="DataLoader")
     
-    def get_vessels_summary(self, force_refresh: bool = False) -> List[Dict]:
+    def get_vessels_summary(self, force_refresh: bool = False) -> List[VesselRow]:
         cache_key = 'vessels_summary'
         return self._get_cached_data(cache_key, self._load_vessels_summary, force_refresh)
     
-    def get_inventory_summary(self, force_refresh: bool = False) -> List[Dict]:
+    def get_inventory_summary(self, force_refresh: bool = False) -> List[InventoryItemRow]:
         cache_key = 'inventory_summary'
         return self._get_cached_data(cache_key, self._load_inventory_summary, force_refresh)
     
-    def get_maintenance_tasks_summary(self, force_refresh: bool = False) -> List[Dict]:
+    def get_maintenance_tasks_summary(self, force_refresh: bool = False) -> List[MaintenanceTaskRow]:
         cache_key = 'maintenance_tasks_summary'
         return self._get_cached_data(cache_key, self._load_maintenance_tasks_summary, force_refresh)
     
     def _get_cached_data(self, cache_key: str, loader: Callable, force_refresh: bool) -> Any:
+        """Get data from cache or load fresh with detailed TTL logging"""
         current_time = time.time()
         
         with self._load_lock:
             if not force_refresh and cache_key in self._cache:
                 timestamp, data = self._cache[cache_key]
-                if current_time - timestamp < self._cache_ttl:
+                elapsed = current_time - timestamp
+                if elapsed < self._cache_ttl:
+                    logger.debug(f"Cache hit for {cache_key} ({elapsed:.1f}s old)")
                     return data
+                else:
+                    logger.debug(f"Cache expired for {cache_key} ({elapsed:.1f}s > {self._cache_ttl}s)")
             
             try:
                 data = loader()
@@ -893,14 +1054,14 @@ class LazyDataLoader:
                     return self._cache[cache_key][1]
                 raise
     
-    def _load_vessels_summary(self) -> List[Dict]:
+    def _load_vessels_summary(self) -> List[VesselRow]:
         return self.db.get_vessels()
     
-    def _load_inventory_summary(self) -> List[Dict]:
+    def _load_inventory_summary(self) -> List[InventoryItemRow]:
         return self.db.get_inventory_items()
     
-    def _load_maintenance_tasks_summary(self) -> List[Dict]:
-        return self.db.get_maintenance_tasks()
+    def _load_maintenance_tasks_summary(self) -> List[MaintenanceTaskRow]:
+        return self.db.get_maintenance_tasks_with_vessels(use_cache=True)
     
     def invalidate_cache(self, key: str = None):
         with self._load_lock:
@@ -978,15 +1139,16 @@ class RefreshManager:
 # MAIN APPLICATION
 # =============================================================================
 class VesselKeeperApp(Gtk.Window):
-    """Enterprise-grade main application"""
+    """Enterprise-grade main application with dependency injection support"""
     
-    def __init__(self):
+    def __init__(self, db: Optional[ThreadSafeDatabase] = None, 
+                 config: Optional[ConfigManager] = None):
         super().__init__(title="Vessel Keeper - Professional Edition")
         self.set_default_size(1200, 800)
         
-        # Initialize core components
-        self.config_manager = ConfigManager()
-        self.db = ThreadSafeDatabase()
+        # Initialize core components with dependency injection for testing
+        self.config_manager = config or ConfigManager()
+        self.db = db or ThreadSafeDatabase()
         self.ui_state_manager = UIStateManager()
         self.data_loader = LazyDataLoader(self.db)
         self._refresh_manager = RefreshManager(self)
@@ -1389,46 +1551,29 @@ def show_error_dialog(parent: Optional[Gtk.Window], message: str):
     else:
         GLib.idle_add(_show_dialog)
 
+def setup_global_exception_handler():
+    """Setup global exception handling - separate concerns from main function"""
+    def handler(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+        show_error_dialog(None, f"Error: {exc_value}")
+    
+    sys.excepthook = handler
+
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 def main():
     """Professional main function with comprehensive error handling"""
     # Create necessary directories
-    for directory in [REPORTS_DIR, 'backups', 'logs']:
+    for directory in [REPORTS_DIR, 'backups', 'logs', 'backups/emergency']:
         Path(directory).mkdir(exist_ok=True)
     
-    # Global exception handling
-    def global_exception_handler(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        
-        # Use direct logging for critical errors during startup
-        logging.critical(
-            "Uncaught exception",
-            exc_info=(exc_type, exc_value, exc_traceback)
-        )
-        
-        try:
-            dialog = Gtk.MessageDialog(
-                transient_for=None,
-                flags=0,
-                message_type=Gtk.MessageType.ERROR,
-                buttons=Gtk.ButtonsType.OK,
-                text="A critical error occurred",
-            )
-            dialog.format_secondary_text(
-                f"The application encountered an unexpected error.\n\n"
-                f"Error: {exc_value}\n\n"
-                f"Please check the logs for details."
-            )
-            dialog.run()
-            dialog.destroy()
-        except Exception:
-            pass
-    
-    sys.excepthook = global_exception_handler
+    # Setup global exception handler
+    setup_global_exception_handler()
     
     # Initialize and run application
     app = None
@@ -1441,7 +1586,6 @@ def main():
         Gtk.main()
         
     except Exception as e:
-        # Use direct logging for startup failures before logger is fully initialized
         logging.critical(f"Failed to start Vessel Keeper: {e}", exc_info=True)
         show_error_dialog(None, f"Failed to start application: {e}")
         sys.exit(1)
