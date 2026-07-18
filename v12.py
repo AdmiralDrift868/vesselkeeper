@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Vessel Keeper - Enterprise Marine Vessel Management System
-Senior-Level Refactor: Professional architecture with enhanced error handling,
-threading, resource management, and modern UI patterns.
-"""
-import gi
-gi.require_version('Gtk', '3.0')
-gi.require_version('Pango', '1.0')#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Vessel Keeper - Enterprise Marine Vessel Management System
-Professional commercial-grade application with full CRUD, reporting,
-supplier management, trip logging, inventory control, and more.
-"""
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
